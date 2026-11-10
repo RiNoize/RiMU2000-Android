@@ -29,6 +29,19 @@ public:
 
 	swp30_device();
 
+	// Host diagnostics: not serialized and not safe to read concurrently with
+	// this chip. The render thread publishes snapshots for the Android UI.
+	struct jit_statistics {
+		bool enabled = false, ready = false, baked_ready = false;
+		size_t code_bytes = 0;
+		u64 samples = 0, jit_runs = 0, interpreter_runs = 0;
+		u64 idle_samples = 0, native_samples = 0, baked_runs = 0;
+		u64 build_attempts = 0, build_failures = 0;
+		u64 baked_build_attempts = 0, baked_build_failures = 0;
+		int last_errno = 0;
+	};
+	jit_statistics meg_jit_stats() const;
+
 	// S-MU2000: 包絡線（音量・音程）の 1 サンプルの歩幅。sample_counter はチップの
 	// サンプルの数え値。画面が包絡線の時間を描くのに使う（src/ui の絵）
 	static u16 envelope_step(s32 speed, u32 sample_counter);
@@ -91,9 +104,30 @@ public:
 	}
 	void rand_skip(u32 n)
 	{
-		u32 mul, add;
-		rand_jump(n, mul, add);
-		m_rand_seed = mul * m_rand_seed + add;
+		// At most two random draws per MEG instruction, across 384 instructions.
+		// Silent MEG programs use the same jump every sample. Precompute the
+		// affine transforms once at compile time instead of repeating up to
+		// 768 LCG steps on the audio thread. Unsigned arithmetic keeps wrapping
+		// exactly as rand(); no mutable cache or extra per-instance state.
+		static constexpr auto jumps = [] {
+			std::array<std::array<u32, 2>, 2 * 384 + 1> table{};
+			u32 mul = 1, add = 0;
+			for (auto &entry : table) {
+				entry = {mul, add};
+				mul *= 1664525u;
+				add = 1664525u * add + 1013904223u;
+			}
+			return table;
+		}();
+		if (n < jumps.size()) {
+			const auto &jump = jumps[n];
+			m_rand_seed = jump[0] * m_rand_seed + jump[1];
+		} else {
+			// Preserve the helper's behavior for callers outside the MEG range.
+			u32 mul, add;
+			rand_jump(n, mul, add);
+			m_rand_seed = mul * m_rand_seed + add;
+		}
 	}
 	void set_rand_seed(u32 seed) { m_rand_seed_base = seed; m_rand_seed = seed; }
 
@@ -768,6 +802,7 @@ private:
 	void mixer_step(const std::array<s32, 0x40> &samples_per_chan);
 	void adc_step();
 	void sample_step();
+	jit_statistics m_jit_statistics{};
 };
 
 #endif // MAME_SOUND_SWP30_H

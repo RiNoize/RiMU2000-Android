@@ -79,6 +79,7 @@
 #endif
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
@@ -159,6 +160,16 @@ bool sh2_device::jit_enabled()
 		return !(e && e[0] == '1');
 	}();
 	return on;
+}
+
+sh2_device::jit_statistics sh2_device::jit_stats() const
+{
+	jit_statistics result = m_jit_statistics;
+	result.enabled = jit_enabled();
+	result.native_code = result.enabled && native_enabled();
+	result.ready = m_jit && m_jit->enter;
+	result.code_bytes = m_jit ? m_jit->used : 0;
+	return result;
 }
 
 void sh2_device::jit_flush()
@@ -262,9 +273,12 @@ bool sh2_device::jit_run()
 	jit::code_t code = *m_jit->slot(pc);
 	if (!code) {
 		// 訳している途中で置き場が一杯になると全部捨てるので、置き場は訳した後に引き直す
+		++m_jit_statistics.compile_attempts;
 		code = m_jit->compile(*this, pc);
-		if (!code)
+		if (!code) {
+			++m_jit_statistics.compile_failures;
 			return false;
+		}
 		*m_jit->slot(pc) = code;
 	}
 	if (smu2000::g_pc_prof) {
@@ -274,6 +288,8 @@ bool sh2_device::jit_run()
 	m_jit->entry = code;
 	const int before = m_sh2_state->icount;
 	m_jit->enter(this, m_sh2_state, m_program->hot_rom(), m_program->hot_ram());
+	++m_jit_statistics.entries;
+	m_jit_statistics.cycles += u64(before - m_sh2_state->icount);
 	if (smu2000::g_pc_prof)
 		smu2000::g_pc_prof_why[4] += u64(before - m_sh2_state->icount);
 	return true;
@@ -352,8 +368,13 @@ bool sh2_device::jit::init(sh2_device &cpu)
 {
 	using namespace x64asm;		// RWX buffer: code runs in place as soon as it is written (rebuilds overwrite it, so no protect swapping)
 	buf = exec_mem::alloc_rwx(BUF_SIZE);
-	if (!buf)
+	if (!buf) {
+		++cpu.m_jit_statistics.allocation_failures;
+#if !defined(_WIN32)
+		cpu.m_jit_statistics.last_errno = errno;
+#endif
 		return false;
+	}
 #if SMU_X64ASM_MODE == 32
 	if (sizeof(pages[0]) != 4)
 #else
@@ -1041,8 +1062,13 @@ bool sh2_device::jit::init(sh2_device &cpu)
 {
 	using namespace a64;
 	buf = exec_mem::alloc_rwx(BUF_SIZE);
-	if (!buf)
+	if (!buf) {
+		++cpu.m_jit_statistics.allocation_failures;
+#if !defined(_WIN32)
+		cpu.m_jit_statistics.last_errno = errno;
+#endif
 		return false;
+	}
 	if (sizeof(pages[0]) != 8)
 		return false;
 	const internal_sh2_state *st = cpu.m_sh2_state;

@@ -222,7 +222,7 @@ public final class MainActivity extends Activity {
         TextView title = text("RiMU2000", 30, INK);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         content.addView(title);
-        content.addView(text("YAMAHA MU2000 · MOTOR S-MU2000 · ALPHA 0.1.0", 11, MUTED));
+        content.addView(text("YAMAHA MU2000 · MOTOR S-MU2000 · ALPHA 0.1.1", 11, MUTED));
 
         LinearLayout display = card(content, 0xff0d2b43);
         TextView displayTitle = text("MU2000  /  ANDROID", 13, ACCENT);
@@ -348,7 +348,7 @@ public final class MainActivity extends Activity {
 
     private void showLicenses() {
         worker.execute(() -> {
-            StringBuilder contents = new StringBuilder("RiMU2000 Android · alpha 0.1.0\n\n")
+            StringBuilder contents = new StringBuilder("RiMU2000 Android · alpha 0.1.1\n\n")
                     .append("Adaptación para Android del proyecto S-MU2000 de tarboh.\n")
                     .append("Proyecto no oficial, sin relación con Yamaha.\n\n")
                     .append("Código fuente del port:\nhttps://github.com/RiNoize/RiMU2000-Android\n\n")

@@ -259,11 +259,13 @@ void sh2_device::execute_run()
 	}
 
 	const bool use_jit = jit_enabled();
+	const int initial_cycles = m_sh2_state->icount;
 	do
 	{
 		// S-MU2000: 訳せる所は訳した物で回す。1 命令以上進めて、icount も同じだけ減っている
 		if (use_jit && jit_run())
 			continue;
+		++m_jit_statistics.interpreter_instructions;
 
 		debugger_instruction_hook(m_sh2_state->pc);
 		if (jit_trace_on())
@@ -288,6 +290,7 @@ void sh2_device::execute_run()
 		}
 		m_sh2_state->icount--;
 	} while (m_sh2_state->icount > 0);
+	m_jit_statistics.total_cycles += u64(initial_cycles - m_sh2_state->icount);
 }
 
 // S-MU2000: init_drc_frontend() は削除（DRC を使わない）

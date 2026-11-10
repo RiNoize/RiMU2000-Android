@@ -6,6 +6,7 @@
 #include "mu2000.h"
 #include "ui/resampler.h"
 #include "midi_queue.h"
+#include "performance_hint.h"
 
 #include <algorithm>
 #include <array>
@@ -16,20 +17,129 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <sched.h>
 #include <stdexcept>
 #include <string>
 #include <time.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
 constexpr int kEngineRate = 44100;
 constexpr int kRenderChunk = 256;
 constexpr int kStagingFrames = 2048;
+constexpr std::uint64_t kStatisticsWindowNs = 1000000000ULL;
 
 std::uint64_t clockNs(clockid_t clock) {
     timespec ts{};
     if (clock_gettime(clock, &ts) != 0) return 0;
     return std::uint64_t(ts.tv_sec) * 1000000000ULL + std::uint64_t(ts.tv_nsec);
+}
+
+std::uint64_t elapsedSince(std::uint64_t begin, std::uint64_t end) {
+    return end >= begin ? end - begin : 0;
+}
+
+const char* schedulerName(int policy) {
+    switch (policy) {
+    case SCHED_OTHER: return "NORMAL";
+    case SCHED_FIFO: return "FIFO";
+    case SCHED_RR: return "RR";
+    case SCHED_BATCH: return "BATCH";
+    case SCHED_IDLE: return "IDLE";
+    default: return "?";
+    }
+}
+
+struct TimingWindow {
+    std::uint64_t started = 0, span = 0, frames = 0, elapsed = 0, cpu = 0;
+    std::uint64_t core = 0, conversion = 0, callbacks = 0, late = 0, cpuMask = 0;
+    float maximum = 0;
+};
+
+// One writer (audio), non-blocking readers (UI). Every data member is atomic,
+// including across the brief publication boundary; readers retry at most twice.
+struct PublishedWindow {
+    std::atomic<std::uint64_t> serial{0}, span{0}, frames{0}, elapsed{0}, cpu{0},
+        core{0}, conversion{0}, callbacks{0}, late{0}, cpuMask{0};
+    std::atomic<float> maximum{0};
+
+    void publish(const TimingWindow& window) {
+        serial.fetch_add(1, std::memory_order_acq_rel);
+        span.store(window.span, std::memory_order_relaxed);
+        frames.store(window.frames, std::memory_order_relaxed);
+        elapsed.store(window.elapsed, std::memory_order_relaxed);
+        cpu.store(window.cpu, std::memory_order_relaxed);
+        core.store(window.core, std::memory_order_relaxed);
+        conversion.store(window.conversion, std::memory_order_relaxed);
+        callbacks.store(window.callbacks, std::memory_order_relaxed);
+        late.store(window.late, std::memory_order_relaxed);
+        cpuMask.store(window.cpuMask, std::memory_order_relaxed);
+        maximum.store(window.maximum, std::memory_order_relaxed);
+        serial.fetch_add(1, std::memory_order_release);
+    }
+    bool read(TimingWindow& result) const {
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            const auto before = serial.load(std::memory_order_acquire);
+            if (before & 1) continue;
+            result.span = span.load(std::memory_order_relaxed);
+            result.frames = frames.load(std::memory_order_relaxed);
+            result.elapsed = elapsed.load(std::memory_order_relaxed);
+            result.cpu = cpu.load(std::memory_order_relaxed);
+            result.core = core.load(std::memory_order_relaxed);
+            result.conversion = conversion.load(std::memory_order_relaxed);
+            result.callbacks = callbacks.load(std::memory_order_relaxed);
+            result.late = late.load(std::memory_order_relaxed);
+            result.cpuMask = cpuMask.load(std::memory_order_relaxed);
+            result.maximum = maximum.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (before == serial.load(std::memory_order_relaxed))
+                return result.callbacks > 0;
+        }
+        return false;
+    }
+};
+
+struct PublishedJit {
+    // flags: enabled, native SH2 code, ready, ready baked MEG code.
+    std::atomic<unsigned> flags{0};
+    std::atomic<std::uint64_t> work{0}, jit{0}, interpreter{0}, idle{0}, nativeFx{0},
+        baked{0}, failures{0}, bakedFailures{0}, allocationFailures{0};
+    std::atomic<int> error{0};
+    void reset() {
+        flags.store(0); work.store(0); jit.store(0); interpreter.store(0); idle.store(0);
+        nativeFx.store(0); baked.store(0); failures.store(0); bakedFailures.store(0);
+        allocationFailures.store(0); error.store(0);
+    }
+};
+
+std::string percentage(std::uint64_t part, std::uint64_t whole) {
+    if (!whole) return "--";
+    char value[32];
+    std::snprintf(value, sizeof(value), "%.1f%%", double(part) * 100.0 / double(whole));
+    return value;
+}
+
+std::string megDescription(const PublishedJit& stats, const char* name) {
+    const unsigned flags = stats.flags.load(std::memory_order_relaxed);
+    const auto jit = stats.jit.load(std::memory_order_relaxed);
+    const auto interpreter = stats.interpreter.load(std::memory_order_relaxed);
+    const auto work = stats.work.load(std::memory_order_relaxed);
+    const auto idle = stats.idle.load(std::memory_order_relaxed);
+    const auto native = stats.nativeFx.load(std::memory_order_relaxed);
+    const auto baked = stats.baked.load(std::memory_order_relaxed);
+    char out[384];
+    std::snprintf(out, sizeof(out),
+        "MEG %s: JIT %s · intérp %s · reposo %s · bake %s · %s/%s · fallos G/B %llu/%llu errno%d",
+        name, percentage(jit, jit + interpreter).c_str(),
+        percentage(interpreter, jit + interpreter).c_str(), percentage(idle, work).c_str(),
+        percentage(baked, jit).c_str(), (flags & 1) ? "ON" : "OFF",
+        (flags & 4) ? "listo" : "sin código",
+        static_cast<unsigned long long>(stats.failures.load()),
+        static_cast<unsigned long long>(stats.bakedFailures.load()), stats.error.load());
+    std::string result = out;
+    if (native) result += " · FX nativo " + percentage(native, work);
+    return result;
 }
 
 std::string fromJava(JNIEnv* env, jstring text) {
@@ -131,6 +241,8 @@ public:
             rate_.store(rate);
             observedFrames_.store(AAudioStream_getFramesPerDataCallback(stream_));
             device_.store(AAudioStream_getDeviceId(stream_));
+            performanceMode_.store(AAudioStream_getPerformanceMode(stream_));
+            sharingMode_.store(AAudioStream_getSharingMode(stream_));
             const int burst = std::max(1, AAudioStream_getFramesPerBurst(stream_));
             burst_.store(burst);
             const int capacity = AAudioStream_getBufferCapacityInFrames(stream_);
@@ -142,6 +254,7 @@ public:
             midi_.reset();
             panic_.store(false);
             midi_.setEnabled(true);
+            performanceHint_.start();
             startTime_.store(clockNs(CLOCK_MONOTONIC));
             startCpu_.store(clockNs(CLOCK_PROCESS_CPUTIME_ID));
             running_.store(true, std::memory_order_release);
@@ -207,20 +320,83 @@ public:
         const auto began = startTime_.load(), cpuBegan = startCpu_.load();
         const double appCpu = running() && began && time > began && cpu >= cpuBegan ?
             double(cpu - cpuBegan) * 100.0 / double(time - began) : 0.0;
-        char out[1024];
+        TimingWindow recent;
+        const bool hasRecent = recent_.read(recent);
+        if (!hasRecent) {
+            recent.span = began && time >= began ? time - began : 0;
+            recent.frames = samples;
+            recent.elapsed = elapsed;
+            recent.cpu = audioCpuNs_.load();
+            recent.core = coreNs_.load();
+            recent.conversion = conversionNs_.load();
+            recent.callbacks = callbacks_.load();
+            recent.late = late_.load();
+            recent.maximum = maxPercent_.load();
+            recent.cpuMask = cpuMask_.load();
+        }
+        const auto percentOfAudio = [rate, &recent](std::uint64_t ns) {
+            return recent.frames && rate > 0
+                    ? double(ns) * rate / (double(recent.frames) * 10000000.0) : 0.0;
+        };
+        const double blockDivisor = recent.callbacks ? double(recent.callbacks) * 1000000.0 : 1.0;
+        const double budgetMs = recent.callbacks && rate > 0
+                ? double(recent.frames) * 1000.0 / (double(recent.callbacks) * rate) : 0.0;
+        const double audioOccupancy = recent.span
+                ? double(recent.cpu) * 100.0 / double(recent.span) : 0.0;
+        std::string cpus;
+        for (int cpuIndex = 0; cpuIndex < 64; ++cpuIndex) {
+            if ((recent.cpuMask >> cpuIndex) & 1) {
+                if (!cpus.empty()) cpus += ",";
+                cpus += std::to_string(cpuIndex);
+            }
+        }
+        if (cpus.empty()) cpus = "-";
+        const char* performance = performanceMode_.load() == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY
+                ? "LOW_LATENCY" : performanceMode_.load() == AAUDIO_PERFORMANCE_MODE_POWER_SAVING
+                ? "POWER_SAVING" : "NONE";
+        const char* sharing = sharingMode_.load() == AAUDIO_SHARING_MODE_EXCLUSIVE ? "EXCLUSIVE" : "SHARED";
+        std::string jitText = "JIT: esperando el primer intervalo de audio.";
+        if (jitPublished_.load(std::memory_order_acquire)) {
+            const auto flags = shJit_.flags.load(std::memory_order_relaxed);
+            char sh[256];
+            std::snprintf(sh, sizeof(sh),
+                "SH2 JIT %s ciclos · %s · nativo %s · listo %s · fallos %llu (mem %llu) errno%d",
+                percentage(shJit_.jit.load(), shJit_.work.load()).c_str(),
+                (flags & 1) ? "ON" : "OFF", (flags & 2) ? "sí" : "no",
+                (flags & 4) ? "sí" : "no",
+                static_cast<unsigned long long>(shJit_.failures.load()),
+                static_cast<unsigned long long>(shJit_.allocationFailures.load()), shJit_.error.load());
+            jitText = std::string(sh) + "\n" + megDescription(masterJit_, "M") +
+                      "\n" + megDescription(slaveJit_, "S");
+        }
+        char out[3072];
         std::snprintf(out, sizeof(out),
-            "%s\nRender medio %.1f%% · máximo %.1f%% · CPU app %.1f%%\n"
-            "Xruns %d · callbacks fuera de presupuesto %llu / %llu\n"
+            "%s · %s %.2f s: render %.1f%% (máx %.1f%%)\n"
+            "Bloque %.2f ms reloj / %.2f ms CPU / %.2f ms disponibles · motor %.1f%% + conversión %.1f%%\n"
+            "Total render %.1f%% (máx %.1f%%) · CPU hilo %.1f%% / app %.1f%% (100%% = 1 núcleo)\n"
+            "Xruns %d · tarde reciente %llu/%llu · total %llu/%llu\n"
             "44100 → %d Hz · callback %d fr (pedido %d) · buffer real %d fr · ráfaga %d\n"
             "MIDI %llu bytes · descartados %llu · pendientes %llu · salida ID %d\n"
-            "ARM64 · JIT SH2/MEG compilados · firmware original · 1 hilo de render%s",
-            label, average, double(maxPercent_.load()), appCpu, xruns_.load(),
+            "Hilo %d · CPU #%d · vistas %s · %s prioridad %d · AAudio %s/%s\n"
+            "ADPF %s · informes %llu · omitidos %llu · error %d\n"
+            "%s\nARM64 · firmware original · 1 hilo de render%s",
+            label, hasRecent ? "Reciente" : "Inicial", double(recent.span) / 1000000000.0,
+            percentOfAudio(recent.elapsed), double(recent.maximum),
+            double(recent.elapsed) / blockDivisor, double(recent.cpu) / blockDivisor, budgetMs,
+            percentOfAudio(recent.core), percentOfAudio(recent.conversion),
+            average, double(maxPercent_.load()), audioOccupancy, appCpu, xruns_.load(),
+            static_cast<unsigned long long>(recent.late), static_cast<unsigned long long>(recent.callbacks),
             static_cast<unsigned long long>(late_.load()),
             static_cast<unsigned long long>(callbacks_.load()), rate, observedFrames_.load(), requestedFrames_.load(),
             actualBuffer_.load(), burst_.load(),
             static_cast<unsigned long long>(midiReceived_.load()),
             static_cast<unsigned long long>(dropped_.load() + internalDropped_.load()),
             static_cast<unsigned long long>(pendingMidi_.load()), device_.load(),
+            audioTid_.load(), lastCpu_.load(), cpus.c_str(), schedulerName(policy_.load()),
+            priority_.load(), performance, sharing,
+            performanceHint_.statusText(), static_cast<unsigned long long>(performanceHint_.reports()),
+            static_cast<unsigned long long>(performanceHint_.dropped()), performanceHint_.error(),
+            jitText.c_str(),
             nvramWarning_.load() ? "\nNo se pudieron guardar los ajustes de la sesión." : "");
         return out;
     }
@@ -276,6 +452,8 @@ private:
             AAudioStream_close(stream_);
             stream_ = nullptr;
         }
+        // Session API calls and its worker never outlive the stream callback.
+        performanceHint_.stop();
         // AAudio close has joined its callback before the emulator is touched.
         saveNvram();
         mu_.reset();
@@ -295,6 +473,15 @@ private:
         internalDropped_.store(0); pendingMidi_.store(0); observedFrames_.store(0);
         rate_.store(0); actualBuffer_.store(0); burst_.store(0); device_.store(0);
         startTime_.store(0); startCpu_.store(0); nvramWarning_.store(false);
+        audioCpuNs_.store(0); coreNs_.store(0); conversionNs_.store(0); cpuMask_.store(0);
+        audioTid_.store(0); lastCpu_.store(-1); policy_.store(-1); priority_.store(0);
+        performanceMode_.store(AAUDIO_PERFORMANCE_MODE_NONE);
+        sharingMode_.store(AAUDIO_SHARING_MODE_SHARED);
+        window_ = {};
+        recent_.publish(window_);
+        jitBaseline_ = false;
+        jitPublished_.store(false);
+        shJit_.reset(); masterJit_.reset(); slaveJit_.reset();
     }
 
     void sendPanic() {
@@ -312,6 +499,47 @@ private:
         }
     }
 
+    // Only the callback touches the core's ordinary (non-atomic) counters.
+    // Establish the baseline before its first generated sample, excluding boot.
+    void beginJitWindow() {
+        previousShJit_ = mu_->cpu().jit_stats();
+        previousMasterJit_ = mu_->swpm().meg_jit_stats();
+        previousSlaveJit_ = mu_->swps().meg_jit_stats();
+        jitBaseline_ = true;
+    }
+
+    void publishJitWindow() {
+        const auto sh = mu_->cpu().jit_stats();
+        shJit_.flags.store(unsigned(sh.enabled) | (unsigned(sh.native_code) << 1) |
+                           (unsigned(sh.ready) << 2), std::memory_order_relaxed);
+        shJit_.work.store(elapsedSince(previousShJit_.total_cycles, sh.total_cycles));
+        shJit_.jit.store(elapsedSince(previousShJit_.cycles, sh.cycles));
+        shJit_.interpreter.store(elapsedSince(previousShJit_.interpreter_instructions,
+                                             sh.interpreter_instructions));
+        shJit_.failures.store(sh.compile_failures);
+        shJit_.allocationFailures.store(sh.allocation_failures);
+        shJit_.error.store(sh.last_errno);
+        previousShJit_ = sh;
+        const auto publishMeg = [](const swp30_device::jit_statistics& current,
+                                   swp30_device::jit_statistics& previous, PublishedJit& output) {
+            output.flags.store(unsigned(current.enabled) | (unsigned(current.ready) << 2) |
+                               (unsigned(current.baked_ready) << 3), std::memory_order_relaxed);
+            output.work.store(elapsedSince(previous.samples, current.samples));
+            output.jit.store(elapsedSince(previous.jit_runs, current.jit_runs));
+            output.interpreter.store(elapsedSince(previous.interpreter_runs, current.interpreter_runs));
+            output.idle.store(elapsedSince(previous.idle_samples, current.idle_samples));
+            output.nativeFx.store(elapsedSince(previous.native_samples, current.native_samples));
+            output.baked.store(elapsedSince(previous.baked_runs, current.baked_runs));
+            output.failures.store(current.build_failures);
+            output.bakedFailures.store(current.baked_build_failures);
+            output.error.store(current.last_errno);
+            previous = current;
+        };
+        publishMeg(mu_->swpm().meg_jit_stats(), previousMasterJit_, masterJit_);
+        publishMeg(mu_->swps().meg_jit_stats(), previousSlaveJit_, slaveJit_);
+        jitPublished_.store(true, std::memory_order_release);
+    }
+
     static aaudio_data_callback_result_t dataCallback(
             AAudioStream* stream, void* context, void* audio, int32_t count) {
         return static_cast<Engine*>(context)->render(stream, static_cast<float*>(audio), count);
@@ -323,7 +551,21 @@ private:
             std::fill_n(output, std::size_t(count) * 2, 0.0f);
             return AAUDIO_CALLBACK_RESULT_STOP;
         }
+        if (!jitBaseline_) beginJitWindow();
+        const int tid = gettid();
+        const int firstCpu = sched_getcpu();
+        if (audioTid_.load(std::memory_order_relaxed) != tid ||
+            (callbacks_.load(std::memory_order_relaxed) & 31) == 0) {
+            audioTid_.store(tid, std::memory_order_relaxed);
+            policy_.store(sched_getscheduler(0), std::memory_order_relaxed);
+            sched_param parameters{};
+            if (sched_getparam(0, &parameters) == 0)
+                priority_.store(parameters.sched_priority, std::memory_order_relaxed);
+        }
         const auto begin = clockNs(CLOCK_MONOTONIC);
+        const auto cpuBegin = clockNs(CLOCK_THREAD_CPUTIME_ID);
+        auto boundary = begin;
+        std::uint64_t coreElapsed = 0, conversionElapsed = 0;
         try {
             for (int done = 0; done < count; ) {
                 if (panic_.exchange(false, std::memory_order_acq_rel)) sendPanic();
@@ -344,10 +586,14 @@ private:
                     staging_[i * 2] = s16(std::clamp(l >> 2, -32768, 32767));
                     staging_[i * 2 + 1] = s16(std::clamp(r >> 2, -32768, 32767));
                 }
+                const auto coreEnd = clockNs(CLOCK_MONOTONIC);
+                coreElapsed += elapsedSince(boundary, coreEnd);
                 resampler_.push(staging_.data(), need);
                 resampler_.pull(output + done * 2, chunk);
                 const float gain = gain_.load(std::memory_order_relaxed);
                 for (int i = 0; i < chunk * 2; ++i) output[done * 2 + i] *= gain;
+                boundary = clockNs(CLOCK_MONOTONIC);
+                conversionElapsed += elapsedSince(coreEnd, boundary);
                 done += chunk;
             }
         } catch (...) {
@@ -356,7 +602,15 @@ private:
             state_.store(State::failed);
             return AAUDIO_CALLBACK_RESULT_STOP;
         }
-        const auto elapsed = clockNs(CLOCK_MONOTONIC) - begin;
+        const auto end = clockNs(CLOCK_MONOTONIC);
+        const auto elapsed = elapsedSince(begin, end);
+        const auto cpuElapsed = elapsedSince(cpuBegin, clockNs(CLOCK_THREAD_CPUTIME_ID));
+        const int finalCpu = sched_getcpu();
+        lastCpu_.store(finalCpu, std::memory_order_relaxed);
+        std::uint64_t observedCpus = 0;
+        if (firstCpu >= 0 && firstCpu < 64) observedCpus |= std::uint64_t(1) << firstCpu;
+        if (finalCpu >= 0 && finalCpu < 64) observedCpus |= std::uint64_t(1) << finalCpu;
+        cpuMask_.fetch_or(observedCpus, std::memory_order_relaxed);
         const double fraction = double(elapsed) * rate_.load(std::memory_order_relaxed) /
                                 (double(count) * 1000000000.0);
         const float percent = float(fraction * 100.0);
@@ -364,12 +618,36 @@ private:
         if (percent > maxPercent_.load(std::memory_order_relaxed)) maxPercent_.store(percent);
         if (fraction > 1.0) late_.fetch_add(1, std::memory_order_relaxed);
         elapsedNs_.fetch_add(elapsed, std::memory_order_relaxed);
+        audioCpuNs_.fetch_add(cpuElapsed, std::memory_order_relaxed);
+        coreNs_.fetch_add(coreElapsed, std::memory_order_relaxed);
+        conversionNs_.fetch_add(conversionElapsed, std::memory_order_relaxed);
         observedFrames_.store(count, std::memory_order_relaxed);
         internalDropped_.store(mu_->midi_dropped(), std::memory_order_relaxed);
         pendingMidi_.store(mu_->midi_pending(), std::memory_order_relaxed);
         frames_.fetch_add(std::uint64_t(count), std::memory_order_relaxed);
         callbacks_.fetch_add(1, std::memory_order_relaxed);
         xruns_.store(std::max(0, AAudioStream_getXRunCount(stream)), std::memory_order_relaxed);
+        if (!window_.started) window_.started = begin;
+        window_.span = elapsedSince(window_.started, end);
+        window_.frames += std::uint64_t(count);
+        window_.elapsed += elapsed;
+        window_.cpu += cpuElapsed;
+        window_.core += coreElapsed;
+        window_.conversion += conversionElapsed;
+        window_.callbacks++;
+        window_.late += fraction > 1.0 ? 1 : 0;
+        window_.maximum = std::max(window_.maximum, percent);
+        window_.cpuMask |= observedCpus;
+        if (window_.span >= kStatisticsWindowNs) {
+            publishJitWindow();
+            recent_.publish(window_);
+            window_ = {};
+            // Include the idle gap before the next callback in CPU occupancy.
+            window_.started = end;
+        }
+        const auto targetNs = std::int64_t(count) * 1000000000LL /
+                              std::max(1, rate_.load(std::memory_order_relaxed));
+        performanceHint_.submit(tid, targetNs, std::int64_t(elapsed));
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
 
@@ -387,14 +665,25 @@ private:
     ui::resampler resampler_;
     std::array<s16, kStagingFrames * 2> staging_{};
     rimu2000::MidiQueue midi_;
+    rimu2000::PerformanceHint performanceHint_;
+    TimingWindow window_;
+    PublishedWindow recent_;
+    bool jitBaseline_ = false; // callback-owned; reset only after close
+    sh2_device::jit_statistics previousShJit_{};
+    swp30_device::jit_statistics previousMasterJit_{}, previousSlaveJit_{};
+    PublishedJit shJit_, masterJit_, slaveJit_;
+    std::atomic<bool> jitPublished_{false};
     std::string stateDir_;
     bool booted_ = false;
     std::atomic<bool> running_{false}, cancelled_{false}, panic_{false}, nvramWarning_{false};
     std::atomic<State> state_{State::stopped};
     std::atomic<float> gain_{0.8f}, maxPercent_{0};
     std::atomic<int> rate_{0}, requestedFrames_{1024}, observedFrames_{0}, actualBuffer_{0}, burst_{0}, device_{0}, xruns_{0};
+    std::atomic<int> audioTid_{0}, lastCpu_{-1}, policy_{-1}, priority_{0},
+        performanceMode_{AAUDIO_PERFORMANCE_MODE_NONE}, sharingMode_{AAUDIO_SHARING_MODE_SHARED};
     std::atomic<std::uint64_t> frames_{0}, elapsedNs_{0}, callbacks_{0}, late_{0}, dropped_{0},
-        midiReceived_{0}, internalDropped_{0}, pendingMidi_{0}, startTime_{0}, startCpu_{0};
+        midiReceived_{0}, internalDropped_{0}, pendingMidi_{0}, startTime_{0}, startCpu_{0},
+        audioCpuNs_{0}, coreNs_{0}, conversionNs_{0}, cpuMask_{0};
 };
 
 // Intentionally process-lifetime: close explicitly on the lifecycle worker.

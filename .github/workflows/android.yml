@@ -38,11 +38,13 @@ jobs:
         run: |
           make build-linux/verify -j2
           ./build-linux/verify
-      - name: Check MIDI framing and concurrent queue
+      - name: Check MIDI framing, concurrent queue and random skip
         run: |
           mkdir -p "$RUNNER_TEMP/rimu2000-tests/classes"
           c++ -std=c++20 -O2 -pthread android/native-tests/midi_queue_test.cpp -o "$RUNNER_TEMP/rimu2000-tests/midi-queue-test"
           "$RUNNER_TEMP/rimu2000-tests/midi-queue-test"
+          c++ -std=c++20 -O2 -pthread -I src -I src/compat android/native-tests/random_skip_test.cpp build-linux/src/mame/sound/swp30.o build-linux/src/mame/sound/swp30_jit.o build-linux/src/compat/compat.o build-linux/src/compat/a64asm.o -o "$RUNNER_TEMP/rimu2000-tests/random-skip-test"
+          "$RUNNER_TEMP/rimu2000-tests/random-skip-test"
           javac -d "$RUNNER_TEMP/rimu2000-tests/classes" android/app/src/main/java/com/rinoize/rimu2000/MidiStreamParser.java android/tests/java/com/rinoize/rimu2000/MidiStreamParserTest.java
           java -cp "$RUNNER_TEMP/rimu2000-tests/classes" com.rinoize.rimu2000.MidiStreamParserTest
       - name: Install Android build tools
@@ -53,14 +55,14 @@ jobs:
       - name: Prepare APK and corresponding source
         run: |
           mkdir -p dist
-          cp android/app/build/outputs/apk/debug/app-debug.apk dist/RiMU2000-0.1.0-arm64.apk
-          git archive --format=zip --prefix=RiMU2000-0.1.0-source/ -o dist/RiMU2000-0.1.0-source.zip HEAD
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/RiMU2000-0.1.1-arm64.apk
+          git archive --format=zip --prefix=RiMU2000-0.1.1-source/ -o dist/RiMU2000-0.1.1-source.zip HEAD
       - name: Upload APK and source
         uses: actions/upload-artifact@v4
         with:
-          name: RiMU2000-0.1.0-arm64
+          name: RiMU2000-0.1.1-arm64
           path: |
-            dist/RiMU2000-0.1.0-arm64.apk
-            dist/RiMU2000-0.1.0-source.zip
+            dist/RiMU2000-0.1.1-arm64.apk
+            dist/RiMU2000-0.1.1-source.zip
           if-no-files-found: error
           retention-days: 30

@@ -33,6 +33,18 @@ public:
 
 	void set_frt_input(int state) {} // not every CPU needs this, let the ones that do override it
 
+	// Host diagnostics only: not emulated state and never serialized. Read on
+	// the thread executing this CPU, then publish a snapshot to other threads.
+	struct jit_statistics {
+		bool enabled = false, native_code = false, ready = false;
+		size_t code_bytes = 0;
+		u64 entries = 0, cycles = 0, total_cycles = 0;
+		u64 interpreter_instructions = 0;
+		u64 compile_attempts = 0, compile_failures = 0, allocation_failures = 0;
+		int last_errno = 0;
+	};
+	jit_statistics jit_stats() const;
+
 
 protected:
 
@@ -107,6 +119,7 @@ private:
 	bool jit_run();
 	void jit_flush();
 	std::unique_ptr<jit, void (*)(jit *)> m_jit{nullptr, &jit_delete};
+	jit_statistics m_jit_statistics{};
 };
 
 #endif // MAME_CPU_SH_SH2_H

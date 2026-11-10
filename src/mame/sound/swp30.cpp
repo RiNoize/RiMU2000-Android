@@ -4458,6 +4458,7 @@ void swp30_device::meg_skip_after()
 // 1 サンプル = sample_step() 1 回 + MEG のプログラム 384 ステップ。
 void swp30_device::run_sample(s32 &left, s32 &right)
 {
+	++m_jit_statistics.samples;
 	if(m_meg_program_changed || m_meg_ops_stale) {
 		m_meg->decode_program();
 		// S-MU2000: プログラムか地図が変わったら、区画を数え直して全部回すところから
@@ -4502,26 +4503,33 @@ void swp30_device::run_sample(s32 &left, s32 &right)
 	if(m_meg_tap)
 		std::copy(m_meg->m_m.begin() + 0x20, m_meg->m_m.begin() + 0x30, meg_in.begin());
 	if(m_native && m_native_full) {
+		++m_jit_statistics.native_samples;
 		// S-MU2000: 完全な軽量モード。MEG の 384 段は回さない（doc/native-dsp.md）
 	} else if(m_meg_idle_primed && !m_dbg_meg) {
+		++m_jit_statistics.idle_samples;
 		// S-MU2000: 全部の区画が空で、状態はもう動かない。空の命令が引くはずの乱数だけ進める
 		if(m_meg_idle_rand)
 			rand_skip(m_meg_idle_rand);
 		m_meg->m_pc = 0;
 		m_meg->m_icount -= 0x180;
 	} else if(m_dbg_meg) {
+		++m_jit_statistics.interpreter_runs;
 		// S-MU2000: 1 命令ずつ追うときは元の step() で回す
 		for(int i = 0; i != 384; i++)
 			m_meg->step();
 	} else if(m_profile) {
 		// S-MU2000: MEG だけの時間を測る（blocktime が使う）
 		const auto t0 = std::chrono::steady_clock::now();
-		if(!meg_jit_run())
+		if(!meg_jit_run()) {
+			++m_jit_statistics.interpreter_runs;
 			m_meg->run_program(m_meg_ops.data());
+		}
 		m_t_meg += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
-	} else if(!meg_jit_run())
+	} else if(!meg_jit_run()) {
+		++m_jit_statistics.interpreter_runs;
 		// S-MU2000: 機械語にできていれば、そちらで回す（swp30_jit.cpp）
 		m_meg->run_program(m_meg_ops.data());
+	}
 	// S-MU2000: 空の 1 サンプルを回し終えたら、次からは回さない
 	if(!(m_native && m_native_full) && !m_dbg_meg)
 		m_meg_idle_primed = m_meg_idle_all;

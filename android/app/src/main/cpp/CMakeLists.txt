@@ -17,4 +17,4 @@ target_compile_options(rimu2000 PRIVATE -O3 -Wall -Wextra -Wformat-security)
 target_compile_options(smu2000_core PRIVATE -O3)
 # Keep normal IEEE arithmetic: no fast-math or alterations to the sound engine.
 target_link_options(rimu2000 PRIVATE "-Wl,-z,max-page-size=16384")
-target_link_libraries(rimu2000 PRIVATE smu2000_core aaudio android log)
+target_link_libraries(rimu2000 PRIVATE smu2000_core aaudio android log dl)

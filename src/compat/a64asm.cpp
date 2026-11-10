@@ -74,6 +74,30 @@ u64 a64::selftest()
 		return ~u64(0);
 	u64 bad = 0;
 
+	// MOVZ and MOVN must materialize the full 64 bits, including zero chunks
+	// which need explicit MOVK patches after a MOVN seed. Exercise every
+	// halfword position and the signed coefficients used by the MEG baker.
+	for (u64 value : {u64(0), ~u64(0), u64(1), u64(s64(-1)),
+	                 u64(s64(-32768)), u64(32767), u64(s64(-0x800000)),
+	                 u64(s64(-0x4000000000)), u64(0x3fffffffff),
+	                 u64(0xffff0000ffff0000), u64(0x0000ffff0000ffff),
+	                 u64(0x12340000ffff5678), u64(0xffff12340000ffff)}) {
+		emitter a;
+		a.mov_imm64(X0, value);
+		a.ret();
+		CHECK64(value);
+	}
+	for (u32 hw = 0; hw < 4; ++hw) {
+		for (u64 chunk : {u64(1), u64(0x8000), u64(0xffff)}) {
+			for (u64 value : {chunk << (16 * hw), ~(chunk << (16 * hw))}) {
+				emitter a;
+				a.mov_imm64(X0, value);
+				a.ret();
+				CHECK64(value);
+			}
+		}
+	}
+
 	// ---- data processing: register forms ----------------------------------
 	{
 		emitter a;

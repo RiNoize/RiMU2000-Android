@@ -44,6 +44,7 @@
 #define SMU2000_MEG_JIT 0
 #endif
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -368,6 +369,17 @@ bool swp30_device::meg_jit_enabled()
 #endif
 }
 
+swp30_device::jit_statistics swp30_device::meg_jit_stats() const
+{
+	jit_statistics result = m_jit_statistics;
+	result.enabled = meg_jit_enabled();
+	result.ready = m_jit && m_jit->gen.fn;
+	result.baked_ready = m_jit && m_jit->spec.fn &&
+		m_jit->spec_const_gen == m_meg_const_gen;
+	result.code_bytes = m_jit ? m_jit->gen.buf_size + m_jit->spec.buf_size : 0;
+	return result;
+}
+
 void swp30_device::meg_jit_rebuild()
 {
 	if (!meg_jit_enabled()) {
@@ -378,8 +390,13 @@ void swp30_device::meg_jit_rebuild()
 		m_jit.reset(new meg_jit);
 	meg_jit &j = *m_jit;
 	j.ops = m_meg_ops.data();
-	if (!j.build(j.gen, *m_meg, j.ops, *this, false))
+	++m_jit_statistics.build_attempts;
+	errno = 0;
+	if (!j.build(j.gen, *m_meg, j.ops, *this, false)) {
+		++m_jit_statistics.build_failures;
+		if (errno) m_jit_statistics.last_errno = errno;
 		j.gen.fn = nullptr;
+	}
 	j.gen.revram_enable = m_revram_enable;
 	// プログラムか番地が変わったので、焼き込んだ版は作り直す
 	j.spec.fn = nullptr;
@@ -424,11 +441,16 @@ bool swp30_device::meg_jit_run()
 			c = &j->spec;
 		else if (j->stable >= meg_jit::STABLE && !j->spec_tried) {
 			j->spec_tried = true;
+			++m_jit_statistics.baked_build_attempts;
+			errno = 0;
 			if (j->build(j->spec, *m_meg, j->ops, *this, true)) {
 				j->spec_const_gen = cg;
 				c = &j->spec;
-			} else
+			} else {
+				++m_jit_statistics.baked_build_failures;
+				if (errno) m_jit_statistics.last_errno = errno;
 				j->spec.fn = nullptr;
+			}
 		}
 	}
 
@@ -522,6 +544,8 @@ bool swp30_device::meg_jit_run()
 		}
 	}
 	c->fn(m_meg, this, m_reverb_ram.data());
+	++m_jit_statistics.jit_runs;
+	if (c == &j->spec) ++m_jit_statistics.baked_runs;
 	m_meg->m_pc = 0;
 	m_meg->m_icount -= 0x180;
 	return true;
@@ -1776,11 +1800,9 @@ bool swp30_device::meg_jit::build(code &cd, meg_state &ms, const meg_state::op *
 {
 	using namespace a64;
 
-	// The baked-constant variant of the x86-64 backend has no arm64 equivalent
-	// yet, so asking for it here just fails and the caller keeps the general
-	// version (see meg_jit_run)
-	if (bake)
-		return false;
+	// Both backends specialize stable coefficients. meg_jit_run guards this
+	// version with m_meg_const_gen and uses the general version immediately
+	// when the firmware changes a coefficient, until it stabilizes again.
 
 	cd.fn = nullptr;
 	// Programs that jump (LO-FI and DYNA types) are compiled too, by reading and
@@ -1909,6 +1931,19 @@ bool swp30_device::meg_jit::build(code &cd, meg_state &ms, const meg_state::op *
 			if (u32(k) % 3 == c && ops[k].dm) { last_slot_m[k] = true; break; }
 	}
 
+	// LFO phase and parameters stay fixed during this MEG program. As in
+	// the x86-64 backend, calculate repeated LFO reads once per sample. The
+	// slots are local to this invocation, never cached across samples.
+	u32 lfo_uses[0x18] = {}, lfo_slot[0x18] = {}, lfo_count = 0;
+	if (sintab)
+		for (u32 k = 0; k != 0x180; ++k)
+			if (ops[k].dm && ops[k].dm_src <= 3 && ops[k].lfo < 0x18)
+				++lfo_uses[ops[k].lfo];
+	for (u32 i = 0; i != 0x18; ++i)
+		if (lfo_uses[i] >= 2)
+			lfo_slot[i] = 4 * lfo_count++;
+	const u32 lfo_stack_size = (4 * lfo_count + 15) & ~u32(15);
+
 	emitter a;
 	// Block state in callee-saved registers (rbx/r12-r15 in the x86 version).
 	// A carries the value a program instruction computes, E holds an address
@@ -1979,6 +2014,7 @@ bool swp30_device::meg_jit::build(code &cd, meg_state &ms, const meg_state::op *
 	a.stp_x(X25, X30, X31, -16, true);
 	a.stp_x(X26, X27, X31, -16, true);
 	a.stp_x(X28, X29, X31, -16, true);   // x29 is never touched; it only pads the pair
+	if (lfo_stack_size) a.sub_imm64(X31, X31, lfo_stack_size);
 	a.mov_x(MS, X0);
 	a.mov_x(SWP, X1);
 	a.mov_x(RAM, X2);
@@ -2042,6 +2078,77 @@ bool swp30_device::meg_jit::build(code &cd, meg_state &ms, const meg_state::op *
 			a.mov_x(A, P);
 		pack24();
 	};
+
+	const auto emit_lfo = [&](u32 lfo) {
+		// meg_state::get_lfo in machine code, no call (same shape
+		// as the x86-64 backend). Output A. C, D and E are scratch.
+		static constexpr u32 lfo_offsets[16] = {
+			0x00000, 0x02aaa, 0x04000, 0x05555, 0x08000, 0x0aaaa, 0x0c000, 0x0d555,
+			0x10000, 0x12aaa, 0x14000, 0x15555, 0x18000, 0x1aaaa, 0x1c000, 0x1d555,
+		};
+		ldw(A, MS, o_lfo_counter + 4 * s32(lfo));
+		a.lsr_imm(A, A, 5);
+		cdh(D, o_lfo + 2 * s32(lfo));
+		a.mov_reg(C, D);
+		a.lsr_imm(C, C, 8);
+		a.and_imm(C, C, 3);
+		a.lslv(A, A, C);
+		a.mov_reg(C, D);
+		a.lsr_imm(C, C, 12);
+		a.mov_imm64(E, u64(uintptr_t(lfo_offsets)));
+		a.ldr_w_sr(C, E, C);
+		a.add_reg(A, A, C);
+		a.and_imm(A, A, 0x1ffff);
+		a.lsr_imm(D, D, 10);
+		a.and_imm(D, D, 3);
+		std::vector<size_t> done;
+		a.cmp_imm(D, 0);
+		const size_t not_sine = a.b_cond(NE);
+		{   // sine
+			a.mov_reg(C, A);
+			a.and_imm(C, C, 0x7fff);
+			a.tst_imm(A, 0x8000);
+			const size_t no_rev = a.b_cond(EQ);
+			a.eor_imm(C, C, 0x7fff);
+			a.patch(no_rev);
+			a.mov_imm64(E, u64(uintptr_t(sintab)));
+			a.mov_reg(D, A);
+			a.ldrh_sr(A, E, C);
+			a.tst_imm(D, 0x10000);
+			const size_t no_neg = a.b_cond(EQ);
+			a.eor_imm(A, A, 0xffff);
+			a.patch(no_neg);
+			done.push_back(a.b());
+		}
+		a.patch(not_sine);
+		a.cmp_imm(D, 1);
+		const size_t not_tri = a.b_cond(NE);
+		{   // tri
+			a.add_imm(A, A, 8, 1);               // +0x8000 via imm12 << 12
+			a.and_imm(A, A, 0x1ffff);
+			a.tst_imm(A, 0x10000);
+			const size_t no_fold = a.b_cond(EQ);
+			a.eor_imm(A, A, 0x1ffff);
+			a.patch(no_fold);
+			done.push_back(a.b());
+		}
+		a.patch(not_tri);
+		a.cmp_imm(D, 2);
+		const size_t not_up = a.b_cond(NE);
+		a.lsr_imm(A, A, 1);                              // saw up
+		done.push_back(a.b());
+		a.patch(not_up);
+		a.eor_imm(A, A, 0x1ffff);                        // saw down
+		a.lsr_imm(A, A, 1);
+		for (size_t d : done) a.patch(d);
+		a.lsl_imm(A, A, 7);
+	};
+	for (u32 lfo = 0; lfo != 0x18; ++lfo) {
+		if (lfo_uses[lfo] >= 2) {
+			emit_lfo(lfo);
+			a.str_w(A, X31, lfo_slot[lfo]);
+		}
+	}
 
 	// DEBUG: stop the block early, to bisect against the interpreter. Read once
 	// (see meg_jit_upto); ignored unless the check above is on
@@ -2166,41 +2273,72 @@ bool swp30_device::meg_jit::build(code &cd, meg_state &ms, const meg_state::op *
 		if (!(branchy && o.jump)) {
 
 		// ---- ALU ----
-		if (o.alu) {
-			// the interpreter widens the s16 constant (or t) to s64, so the load
-			// has to sign-extend all the way
-			if (o.m1_from_t == 2) {
-				// MULTI COMP follows its envelope: t when the last latch was
-				// negative, the constant otherwise (meg_state::step, doc/upstream.md #29)
-				cdh_s(A, o_t + 2 * o.t);
-				cdh_s(C, o_const + 2 * s32(k));
-				ldb(D, SWP, o_flag_n);
-				a.cmp_reg(D, WZR);
-				a.csel_x(A, A, C, NE);
-			} else if (o.m1_from_t)
-				cdh_s(A, o_t + 2 * o.t);
-			else
-				cdh_s(A, o_const + 2 * s32(k));
+		// Same exact constant folding as the x86 backend: no reduced precision
+		// and no changes to the firmware's coefficients, delay rings or flags.
+		const bool baked_m1 = bake && !o.m1_from_t && o.mmode != 3;
+		bool alu_skip = false;
+		if (o.alu && baked_m1) {
+			s64 c = ms.m_const[k];
 			if (o.m1_expand)
-				emit_m1_expand(a);
-			switch (o.mmode) {
-			case 0:
-				// mmode 0 (no multiplier) still goes through the shift and the
-				// saturation below, with p as the only source: V DT HARD/SOFT
-				// distort that way (doc/upstream.md #21)
-				a.eor_reg(A, A, A);
-				break;
-			case 1:
-				a.lsl_imm_x(A, A, 8 + 15);
-				break;
-			case 2:
-				ldw_s(C, MS, o.m2_from_m ? o_m + 4 * o.sm : o_r + 4 * o.sr);
-				a.mul_x(A, A, C);
-				break;
-			default:
+				c = meg_state::m1_expand(s16(c));
+			const bool m_zero = o.mmode == 0 || c == 0;
+			if (m_zero && o.asel == 0 && o.rop == 0 && o.shift == 0 && o.clamp == 0 && !o.latch)
+				alu_skip = true; // p is already wrapped to 42 bits
+			else if (m_zero)
+				a.mov_imm32(A, 0);
+			else if (o.mmode == 1)
+				a.mov_imm64(A, u64(c) << (8 + 15));
+			else {
 				ldw_s(A, MS, o.m2_from_m ? o_m + 4 * o.sm : o_r + 4 * o.sr);
-				a.lsl_imm_x(A, A, 15);
-				break;
+				const u64 magnitude = u64(c < 0 ? -c : c);
+				if (magnitude && !(magnitude & (magnitude - 1))) {
+					u32 shift = 0;
+					while ((u64(1) << shift) != magnitude) ++shift;
+					if (shift) a.lsl_imm_x(A, A, shift);
+					if (c < 0) a.neg_x(A, A);
+				} else {
+					a.mov_imm64(C, u64(c));
+					a.mul_x(A, A, C);
+				}
+			}
+		}
+		if (o.alu && !alu_skip) {
+			if (!baked_m1) {
+				// the interpreter widens the s16 constant (or t) to s64, so the load
+				// has to sign-extend all the way
+				if (o.m1_from_t == 2) {
+					// MULTI COMP follows its envelope: t when the last latch was
+					// negative, the constant otherwise (meg_state::step, doc/upstream.md #29)
+					cdh_s(A, o_t + 2 * o.t);
+					cdh_s(C, o_const + 2 * s32(k));
+					ldb(D, SWP, o_flag_n);
+					a.cmp_reg(D, WZR);
+					a.csel_x(A, A, C, NE);
+				} else if (o.m1_from_t)
+					cdh_s(A, o_t + 2 * o.t);
+				else
+					cdh_s(A, o_const + 2 * s32(k));
+				if (o.m1_expand)
+					emit_m1_expand(a);
+				switch (o.mmode) {
+				case 0:
+					// mmode 0 (no multiplier) still goes through the shift and the
+					// saturation below, with p as the only source: V DT HARD/SOFT
+					// distort that way (doc/upstream.md #21)
+					a.eor_reg(A, A, A);
+					break;
+				case 1:
+					a.lsl_imm_x(A, A, 8 + 15);
+					break;
+				case 2:
+					ldw_s(C, MS, o.m2_from_m ? o_m + 4 * o.sm : o_r + 4 * o.sr);
+					a.mul_x(A, A, C);
+					break;
+				default:
+					ldw_s(A, MS, o.m2_from_m ? o_m + 4 * o.sm : o_r + 4 * o.sr);
+					a.lsl_imm_x(A, A, 15);
+					break;
+				}
 			}
 			switch (o.asel) {
 			case 0: a.mov_x(C, P); break;
@@ -2273,68 +2411,10 @@ bool swp30_device::meg_jit::build(code &cd, meg_state &ms, const meg_state::op *
 			switch (o.dm_src) {
 			case 0: case 1: case 2: case 3:
 				if (sintab && o.lfo < 0x18) {
-					// meg_state::get_lfo in machine code, no call (same shape
-					// as the x86-64 backend). Output A. C, D and E are scratch.
-					static constexpr u32 lfo_offsets[16] = {
-						0x00000, 0x02aaa, 0x04000, 0x05555, 0x08000, 0x0aaaa, 0x0c000, 0x0d555,
-						0x10000, 0x12aaa, 0x14000, 0x15555, 0x18000, 0x1aaaa, 0x1c000, 0x1d555,
-					};
-					ldw(A, MS, o_lfo_counter + 4 * s32(o.lfo));
-					a.lsr_imm(A, A, 5);
-					cdh(D, o_lfo + 2 * s32(o.lfo));
-					a.mov_reg(C, D);
-					a.lsr_imm(C, C, 8);
-					a.and_imm(C, C, 3);
-					a.lslv(A, A, C);
-					a.mov_reg(C, D);
-					a.lsr_imm(C, C, 12);
-					a.mov_imm64(E, u64(uintptr_t(lfo_offsets)));
-					a.ldr_w_sr(C, E, C);
-					a.add_reg(A, A, C);
-					a.and_imm(A, A, 0x1ffff);
-					a.lsr_imm(D, D, 10);
-					a.and_imm(D, D, 3);
-					std::vector<size_t> done;
-					a.cmp_imm(D, 0);
-					const size_t not_sine = a.b_cond(NE);
-					{   // sine
-						a.mov_reg(C, A);
-						a.and_imm(C, C, 0x7fff);
-						a.tst_imm(A, 0x8000);
-						const size_t no_rev = a.b_cond(EQ);
-						a.eor_imm(C, C, 0x7fff);
-						a.patch(no_rev);
-						a.mov_imm64(E, u64(uintptr_t(sintab)));
-						a.mov_reg(D, A);
-						a.ldrh_sr(A, E, C);
-						a.tst_imm(D, 0x10000);
-						const size_t no_neg = a.b_cond(EQ);
-						a.eor_imm(A, A, 0xffff);
-						a.patch(no_neg);
-						done.push_back(a.b());
-					}
-					a.patch(not_sine);
-					a.cmp_imm(D, 1);
-					const size_t not_tri = a.b_cond(NE);
-					{   // tri
-						a.add_imm(A, A, 8, 1);               // +0x8000 via imm12 << 12
-						a.and_imm(A, A, 0x1ffff);
-						a.tst_imm(A, 0x10000);
-						const size_t no_fold = a.b_cond(EQ);
-						a.eor_imm(A, A, 0x1ffff);
-						a.patch(no_fold);
-						done.push_back(a.b());
-					}
-					a.patch(not_tri);
-					a.cmp_imm(D, 2);
-					const size_t not_up = a.b_cond(NE);
-					a.lsr_imm(A, A, 1);                              // saw up
-					done.push_back(a.b());
-					a.patch(not_up);
-					a.eor_imm(A, A, 0x1ffff);                        // saw down
-					a.lsr_imm(A, A, 1);
-					for (size_t d : done) a.patch(d);
-					a.lsl_imm(A, A, 7);
+					if (lfo_uses[o.lfo] >= 2)
+						a.ldr_w(A, X31, lfo_slot[o.lfo]);
+					else
+						emit_lfo(o.lfo);
 				} else {
 					a.mov_x(X0, MS);
 					a.mov_imm32(X1, o.lfo);
@@ -2429,6 +2509,8 @@ bool swp30_device::meg_jit::build(code &cd, meg_state &ms, const meg_state::op *
 		if (o.t_write) {
 			if (o.t_from_p)
 				cdh(A, o_t_value + 2 * slot2(k));
+			else if (bake)
+				a.mov_imm32(A, u16(ms.m_const[k]));
 			else
 				cdh(A, o_const + 2 * s32(k));
 			csth(A, o_t + 2 * o.t);
@@ -2555,6 +2637,7 @@ bool swp30_device::meg_jit::build(code &cd, meg_state &ms, const meg_state::op *
 	// exit
 	stx(P, MS, o_p);
 	stw(SEED, SWP, o_seed);
+	if (lfo_stack_size) a.add_imm64(X31, X31, lfo_stack_size);
 	a.ldp_x(X28, X29, X31, 16, true);
 	a.ldp_x(X26, X27, X31, 16, true);
 	a.ldp_x(X25, X30, X31, 16, true);

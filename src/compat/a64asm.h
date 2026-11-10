@@ -109,21 +109,27 @@ struct emitter {
 		else { movz(rd, lo, 0); movk(rd, hi, 1); }
 	}
 
-	// 64-bit constant into an x register. Only the nonzero 16-bit chunks are
-	// emitted (a movz for the highest one, movk for the rest), so small
-	// values take one instruction instead of four: the MEG JIT materializes
-	// constants like 0x800000 per sample, and helper-call addresses only need
-	// three chunks on macOS (high chunk is zero).
+	// 64-bit constant into an x register. Start with whichever of MOVZ/MOVN
+	// needs fewer MOVK patches. In particular, a signed 16-bit MEG constant
+	// now takes one instruction even when negative, rather than four.
 	void mov_imm64(u32 rd, u64 v)
 	{
-		int top = -1;
-		for (int hw = 3; hw >= 0; hw--)
-			if ((v >> (hw * 16)) & 0xffff) { top = hw; break; }
-		if (top < 0) { emit(0xD2800000u | 0 << 21 | 0 << 5 | rd); return; }   // movz xd, #0
-		emit(0xD2800000u | u32(top) << 21 | u32((v >> (top * 16)) & 0xffff) << 5 | rd);
-		for (int hw = top - 1; hw >= 0; hw--) {
-			const u32 chunk = u32((v >> (hw * 16)) & 0xffff);
-			if (chunk) emit(0xF2800000u | u32(hw) << 21 | chunk << 5 | rd);
+		u32 chunks[4];
+		int nonzero = 0, nonones = 0;
+		for (int hw = 0; hw < 4; ++hw) {
+			chunks[hw] = u32((v >> (hw * 16)) & 0xffff);
+			nonzero += chunks[hw] != 0;
+			nonones += chunks[hw] != 0xffff;
+		}
+		const bool invert = nonones < nonzero;
+		const u32 fill = invert ? 0xffff : 0;
+		int first = 3;
+		while (first > 0 && chunks[first] == fill) --first;
+		emit((invert ? 0x92800000u : 0xD2800000u) | u32(first) << 21 |
+		     (invert ? (~chunks[first] & 0xffff) : chunks[first]) << 5 | rd);
+		for (int hw = first - 1; hw >= 0; --hw) {
+			if (chunks[hw] != fill)
+				emit(0xF2800000u | u32(hw) << 21 | chunks[hw] << 5 | rd);
 		}
 	}
 
