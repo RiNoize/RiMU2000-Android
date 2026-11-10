@@ -11,7 +11,12 @@ name: build
 permissions:
   contents: read
 
-on: [push, pull_request]
+# The Android branch has its own native-core checks and APK workflow. Avoid
+# building every desktop/iOS target for Android-only development commits.
+on:
+  push:
+    branches-ignore: [android]
+  pull_request:
 
 jobs:
   macos:
