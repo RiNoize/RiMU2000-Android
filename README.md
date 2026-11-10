@@ -1,5 +1,13 @@
 # S-MU2000
 
+## RiMU2000 para Android
+
+Este fork incorpora una aplicación Android ARM64 en la rama `android`, orientada inicialmente a la Samsung Galaxy Tab A9. Incluye audio AAudio, entrada USB-MIDI, importación de ROMs, teclado táctil y diagnóstico de rendimiento.
+
+**[Instrucciones de la alpha Android y compilación](android/README.md)** · **[Compilaciones en GitHub Actions](https://github.com/RiNoize/RiMU2000-Android/actions/workflows/android.yml)**
+
+El APK no incluye ROMs. La compilación y las pruebas sin ROMs están verificadas; el arranque, el sonido y el rendimiento con firmware requieren una prueba en el dispositivo. La documentación original se conserva debajo.
+
 ## [日本語版はこちら](README.ja.md)
 
 A software tone generator modeled on the Yamaha MU2000, designed to be played as a plug-in inside a DAW.

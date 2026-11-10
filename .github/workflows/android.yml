@@ -1,0 +1,62 @@
+name: Android alpha
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [android]
+    paths:
+      - 'android/**'
+      - 'src/**'
+      - 'LICENSE'
+      - 'NOTICE.txt'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Verify upstream engine without ROMs
+        run: |
+          make build-linux/verify -j2
+          ./build-linux/verify
+      - name: Check MIDI framing and concurrent queue
+        run: |
+          mkdir -p "$RUNNER_TEMP/rimu2000-tests/classes"
+          c++ -std=c++20 -O2 -pthread android/native-tests/midi_queue_test.cpp -o "$RUNNER_TEMP/rimu2000-tests/midi-queue-test"
+          "$RUNNER_TEMP/rimu2000-tests/midi-queue-test"
+          javac -d "$RUNNER_TEMP/rimu2000-tests/classes" android/app/src/main/java/com/rinoize/rimu2000/MidiStreamParser.java android/tests/java/com/rinoize/rimu2000/MidiStreamParserTest.java
+          java -cp "$RUNNER_TEMP/rimu2000-tests/classes" com.rinoize.rimu2000.MidiStreamParserTest
+      - name: Install Android build tools
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+      - name: Build ARM64 alpha
+        working-directory: android
+        run: ./gradlew --no-daemon --console=plain :app:assembleDebug :app:lintDebug
+      - name: Prepare APK and corresponding source
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/RiMU2000-0.1.0-arm64.apk
+          git archive --format=zip --prefix=RiMU2000-0.1.0-source/ -o dist/RiMU2000-0.1.0-source.zip HEAD
+      - name: Upload APK and source
+        uses: actions/upload-artifact@v4
+        with:
+          name: RiMU2000-0.1.0-arm64
+          path: |
+            dist/RiMU2000-0.1.0-arm64.apk
+            dist/RiMU2000-0.1.0-source.zip
+          if-no-files-found: error
+          retention-days: 30

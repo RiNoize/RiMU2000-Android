@@ -1,0 +1,75 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.rinoize.rimu2000'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    ndkVersion '28.2.13676358'
+
+    defaultConfig {
+        applicationId 'com.rinoize.rimu2000'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0-alpha'
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+        externalNativeBuild {
+            cmake {
+                // Emulator performance must be representative in the installable
+                // debug alpha as well. Java stays debuggable; C++ is optimized.
+                arguments '-DCMAKE_BUILD_TYPE=Release', '-DANDROID_STL=c++_shared'
+                cppFlags '-O3', '-DNDEBUG'
+                targets 'rimu2000'
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+            jniDebuggable false
+            minifyEnabled false
+        }
+        release {
+            debuggable false
+            minifyEnabled false
+            // Production signing is intentionally supplied by the owner later.
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging false
+        }
+    }
+
+    sourceSets {
+        main.assets.srcDir(layout.buildDirectory.dir('generated/licenseAssets'))
+    }
+}
+
+// Keep the binary's notices synchronized with the upstream source notices.
+def syncLicenses = tasks.register('syncLicenses', Sync) {
+    from(rootProject.file('..')) {
+        include 'LICENSE', 'NOTICE.txt'
+        into 'licenses'
+    }
+    into(layout.buildDirectory.dir('generated/licenseAssets'))
+}
+tasks.named('preBuild').configure { dependsOn(syncLicenses) }
