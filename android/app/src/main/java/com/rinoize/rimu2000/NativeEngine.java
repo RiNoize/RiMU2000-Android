@@ -17,12 +17,18 @@ public final class NativeEngine {
 
     /** Returns an empty string on success; call only from a lifecycle worker. */
     public static native String start(String romDir, String stateDir,
-                                      int callbackFrames, int deviceId, int cpuMode);
+                                      int bufferFrames, int deviceId, int cpuMode);
     public static native void stop();
     public static native void requestStop();
     public static native void sendMidi(byte[] data, int offset, int count, int port);
     public static native void panic();
     public static native void setGain(float gain);
     public static native String stats();
+    /** Snapshot of firmware state: [voice names, part/bank/program/routing details]. */
+    public static native String[] currentSound(int channel, boolean followProgramChanges);
+    /** The retained slow callbacks; safe to read while audio is running or stopped. */
+    public static native String callbackDiagnostics();
+    /** Enabling starts a fresh capture with scheduling detail; disabling retains records. */
+    public static native void setDetailedDiagnostics(boolean enabled);
     public static native boolean isRunning();
 }

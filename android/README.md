@@ -1,10 +1,42 @@
-# RiMU2000 para Android — 0.1.2 alpha
+# RiMU2000 para Android — 0.1.3 alpha
 
 Primera aplicación independiente para Android del motor de [S-MU2000](https://github.com/tarboh/S-MU2000). Ejecuta el firmware del MU2000 y conserva la emulación del SH7043 y de los dos SWP30, incluidos los compiladores JIT ARM64 de upstream. La interfaz Android conecta ese motor con MIDI y audio del dispositivo.
 
 La alpha está orientada a la Samsung Galaxy Tab A9 y requiere Android 8.0 o superior con CPU ARM64. El rendimiento y la latencia deben medirse en la tablet: que el código compile no garantiza ausencia de cortes con todas las canciones o sonidos.
 
-## Cambios de 0.1.2
+## Cambios de 0.1.3
+
+Esta actualización responde a dos resultados distintos en la A9: con 1024 frames aparecen xruns incluso con sonidos sencillos; con 2048 la reproducción suele ser estable y los cortes aparecen en algunos pads con sustain. La captura de 0.1.2 con afinidad aplicada mostró render reciente del 54,3 %, frente al 127,8 % anterior, pero esas capturas no son un ensayo controlado de todos los sonidos.
+
+- **Callback independiente del buffer.** Se deja `AAudioStreamBuilder_setFramesPerDataCallback` sin tamaño fijo. Android elige los bloques que solicita y la app conserva el buffer seleccionado: 512, 1024 o 2048 frames, redondeado a ráfagas y con un mínimo de dos ráfagas. El panel separa el callback observado del buffer solicitado y del real. No se duplica el buffer de forma oculta. Esto permite entregar fragmentos antes; no garantiza que 1024 funcione en todos los sonidos.
+- **Nombre del sonido real.** El panel superior lee las partes de la RAM del firmware y el registro de voz que éste seleccionó. Muestra nombre, programa 1–128, banco MSB/LSB, parte y ruta de recepción. Por defecto sigue la ruta del último Program Change completo, incluidos mensajes fragmentados y running status. No envía MIDI al refrescar, ni cambia el canal del teclado en pantalla, sus campos de edición o sustain. Si varias partes reciben en esa ruta, aparecen todas.
+- La lectura de nombres utiliza el mapa EX 2.01 que ya emplea el escritorio de upstream. Si la ROM o una voz no tienen un nombre reconocido, se indica **Nombre no disponible**. No se sustituye por un catálogo GM supuesto. Los nombres se resuelven fuera del hilo de audio y no se distribuyen datos de ROM en el APK.
+- **Registro de cortes.** Se conservan los ocho bloques con mayor tiempo de trabajo relativo a su duración de audio, y por separado los cuatro últimos bloques en los que se observó un incremento del contador de xruns. Incluye tiempo de reloj/CPU, intervalo entre callbacks, núcleos inicial/final, bytes MIDI consumidos, intentos de compilación JIT, voces observadas y una parte identificada en ese instante. El historial usa memoria preasignada y datos atómicos; el callback no formatea texto, escribe archivos ni adquiere bloqueos para publicarlo.
+- **Detalle de cortes**, desactivado inicialmente, inicia una captura nueva y añade dos lecturas `getrusage(RUSAGE_THREAD)` por callback para obtener fallos de página y cambios de contexto. Apagar y volver a encender inicia otra captura; apagarlo solo conserva lo registrado y continúa con las medidas básicas. **Copiar diagnóstico** copia al portapapeles local el estado y los registros disponibles, incluso si la sección está cerrada.
+- Se muestran las voces activas de ambos SWP30 y los intentos recientes de compilación SH2/MEG, además de sus fallos acumulados. Las voces incluyen las colas de release y se muestrean entre fragmentos de hasta 256 frames: son máximos observados, no una cuenta exacta de teclas ni de picos entre muestras.
+
+La separación de callback y buffer sigue la [recomendación de Oboe para aplicaciones que aceptan bloques variables](https://github.com/google/oboe/blob/main/include/oboe/AudioStreamBuilder.h). Fijar un callback grande agrupa datos; no garantiza su periodicidad. La [terminología de buffers de Oboe](https://github.com/google/oboe/wiki/TechNote_BufferTerminology) distingue capacidad máxima, tamaño utilizable y ráfaga del dispositivo.
+
+### Cómo interpretar y comparar
+
+El porcentaje compara trabajo medido con la duración de audio del callback. Un callback corto puede superar el 100 % y ser absorbido por la reserva del buffer sin causar un xrun. A la inversa, puede observarse un xrun con trabajo inferior al 100 % si la entrega llegó tarde. El contador de xruns puede actualizarse después del corte: una fila no identifica automáticamente su causa. El intervalo entre inicios no es una medida de latencia de tecla a sonido.
+
+Al cambiar el tamaño del callback también cambia el intervalo sobre el que se mide cada máximo. El máximo de 0.1.3 no debe compararse directamente con el máximo de los bloques de 2048 de 0.1.2; comparar además xruns y carga media para la misma secuencia de notas.
+
+El tiempo de CPU y reloj, los fallos de página, la migración observada y la compilación permiten contrastar hipótesis. Un fallo de página no identifica por sí solo las ROMs, un mismo núcleo al inicio y al final no descarta migraciones intermedias, y consumir MIDI en un bloque no demuestra que ese MIDI causara el pico. La parte guardada en el historial es la primera que recibe en la ruta observada; otras partes también pueden estar aportando carga.
+
+Se conserva la síntesis del firmware, ambos SWP30 y el sinc de 64 coeficientes de 0.1.2. No se activan los modos experimentales `native_engine`/`native_fx`. Tampoco se habilitan temporizadores por muestra del perfil interno: añaden trabajo y, en ejecución serial, algunos contadores agrupan los dos chips.
+
+1. Mantener auriculares y **Núcleos de rendimiento**. Empezar con 2048 y comprobar la máscara efectiva.
+2. Activar **Detalle de cortes** y repetir el pad con sustain que produce el problema. Copiar el diagnóstico antes de cambiar de prueba; ahora incluye su nombre y banco.
+3. Detener, elegir 1024 e iniciar. Hacer una captura breve sin tocar y otra con notas/acordes, reiniciando el detalle entre ellas. El motor sigue emulando aun en silencio; un corte en reposo no demuestra por sí solo un problema del planificador.
+4. Comparar xruns, carga, voces, JIT y los registros de esos incrementos. No extrapolar porcentajes medidos en x86 como si fueran mediciones de la A9.
+
+### Validación de 0.1.3
+
+Las pruebas nuevas usan datos sintéticos: comprueban el mapa de las 64 partes (incluido el orden especial del canal 10), nombres por registro real, bancos/recepción/baterías, límites de memoria y lecturas concurrentes; el seguimiento de Program Change; y la retención y publicación concurrente de los bloques más lentos e incrementos de xruns. Las pruebas del conversor comprueban además que cambiar la división de los bloques conserva su salida. La compilación y Android Lint se ejecutan para ARM64. AAudio, el controlador MIDI y el rendimiento de esta versión requieren la tablet física.
+
+## Cambios anteriores: 0.1.2
 
 Esta actualización responde a una medición en la A9 con JIT activo, pero 54,52 ms de trabajo por cada bloque de 42,67 ms. El motor consumía el 117,5 % del presupuesto y la conversión otro 10,3 %. El modo de CPU y el conversor se pueden evaluar por separado; todavía es necesario comprobar el rendimiento en la tablet.
 
@@ -75,10 +107,10 @@ Los archivos se copian al almacenamiento privado de la aplicación. Si no se imp
 
 1. Instala el APK ARM64 e importa las ROMs.
 2. Conecta el controlador USB-MIDI, selecciónalo en la aplicación y elige la salida de auriculares o altavoz de la tablet.
-3. Empieza con un buffer de **1024 frames**, inicia el audio y prueba unas notas. Si hay cortes, prueba 2048; si funciona estable, prueba 512.
+3. Empieza con un buffer de **2048 frames**, inicia el audio y prueba unas notas. Si funciona estable, prueba 1024 y después 512.
 4. Anota el render, los callbacks fuera de presupuesto y los xruns. Son medidas distintas; el porcentaje de render no equivale a la latencia entre tecla y sonido.
 
-El tamaño elegido es una solicitud a Android. El dispositivo puede negociar otro tamaño de buffer o de callback; el diagnóstico muestra los valores efectivos. Si rechaza el callback solicitado, la aplicación permite que Android elija su tamaño y lo informa allí.
+El tamaño elegido solicita el buffer utilizable. Android elige el tamaño del callback por separado; el diagnóstico muestra ambos valores efectivos. A 48 kHz, 1024 frames representan 21,33 ms de audio y 2048 representan 42,67 ms; esos valores no son una medición de la latencia total entre tecla y sonido.
 
 La alpha detiene el audio al dejar la aplicación. El botón de pánico permite cortar las notas y liberar el pedal. Los mensajes del controlador conservan su canal MIDI. El parser reconstruye los mensajes fragmentados, incluido running status, antes de mezclarlos con los controles de pantalla. En esta versión admite mensajes SysEx de hasta **65 536 bytes**; rechaza completos los que superan ese tamaño y muestra el contador en el diagnóstico MIDI.
 
@@ -109,7 +141,7 @@ No se incluye una clave privada en el repositorio. Una compilación realizada en
 
 ## GitHub Actions
 
-El workflow **Android alpha** compila cuando se actualiza la rama `android` y permite una ejecución manual. Antes del APK ejecuta la verificación del motor de upstream sin ROMs, las pruebas del parser MIDI, de la cola concurrente, del selector de CPU y del conversor sinc; también ejecuta Android Lint. En **Actions → Android alpha → ejecución terminada → Artifacts**, descarga `RiMU2000-0.1.2-arm64`, que contiene el APK y el código fuente de ese commit.
+El workflow **Android alpha** compila cuando se actualiza la rama `android` y permite una ejecución manual. Antes del APK ejecuta la verificación del motor de upstream sin ROMs, las pruebas de MIDI, cola concurrente, selector de CPU, conversor sinc, nombres de partes y registro de callbacks; también ejecuta Android Lint. En **Actions → Android alpha → ejecución terminada → Artifacts**, descarga `RiMU2000-0.1.3-arm64`, que contiene el APK y el código fuente de ese commit.
 
 La compilación de CI no necesita ROMs y no verifica sonido. Las pruebas con firmware y mediciones de rendimiento se realizan por separado en un dispositivo.
 

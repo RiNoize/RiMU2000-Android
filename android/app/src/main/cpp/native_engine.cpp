@@ -8,11 +8,15 @@
 #include "midi_queue.h"
 #include "performance_hint.h"
 #include "audio_cpu_placement.h"
+#include "patch_snapshot.h"
+#include "program_change_tracker.h"
+#include "callback_diagnostics.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -21,6 +25,7 @@
 #include <sched.h>
 #include <stdexcept>
 #include <string>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 #include <vector>
@@ -30,6 +35,7 @@ constexpr int kEngineRate = 44100;
 constexpr int kRenderChunk = 256;
 constexpr int kStagingFrames = 2048;
 constexpr std::uint64_t kStatisticsWindowNs = 1000000000ULL;
+constexpr std::uint64_t kPatchWindowNs = 200000000ULL;
 
 std::uint64_t clockNs(clockid_t clock) {
     timespec ts{};
@@ -106,12 +112,14 @@ struct PublishedJit {
     // flags: enabled, native SH2 code, ready, ready baked MEG code.
     std::atomic<unsigned> flags{0};
     std::atomic<std::uint64_t> work{0}, jit{0}, interpreter{0}, idle{0}, nativeFx{0},
-        baked{0}, failures{0}, bakedFailures{0}, allocationFailures{0};
+        baked{0}, failures{0}, bakedFailures{0}, allocationFailures{0},
+        compilations{0}, bakedCompilations{0};
     std::atomic<int> error{0};
     void reset() {
         flags.store(0); work.store(0); jit.store(0); interpreter.store(0); idle.store(0);
         nativeFx.store(0); baked.store(0); failures.store(0); bakedFailures.store(0);
         allocationFailures.store(0); error.store(0);
+        compilations.store(0); bakedCompilations.store(0);
     }
 };
 
@@ -132,11 +140,13 @@ std::string megDescription(const PublishedJit& stats, const char* name) {
     const auto baked = stats.baked.load(std::memory_order_relaxed);
     char out[384];
     std::snprintf(out, sizeof(out),
-        "MEG %s: JIT %s · intérp %s · reposo %s · bake %s · %s/%s · fallos G/B %llu/%llu errno%d",
+        "MEG %s: JIT %s · intérp %s · reposo %s · bake %s · %s/%s · compila G/B %llu/%llu · fallos %llu/%llu errno%d",
         name, percentage(jit, jit + interpreter).c_str(),
         percentage(interpreter, jit + interpreter).c_str(), percentage(idle, work).c_str(),
         percentage(baked, jit).c_str(), (flags & 1) ? "ON" : "OFF",
         (flags & 4) ? "listo" : "sin código",
+        static_cast<unsigned long long>(stats.compilations.load()),
+        static_cast<unsigned long long>(stats.bakedCompilations.load()),
         static_cast<unsigned long long>(stats.failures.load()),
         static_cast<unsigned long long>(stats.bakedFailures.load()), stats.error.load());
     std::string result = out;
@@ -172,6 +182,10 @@ public:
             mu_ = std::make_unique<mu2000>();
             if (!mu_->load_program(romDir + "/mu2000_flash.bin"))
                 return fail("No se pudo cargar el firmware: " + mu_->error());
+            auto names = std::make_shared<const xg::voice_rom>(mu_->program_rom());
+            patchLayoutKnown_ = names->ok();
+            patches_.configure(patchLayoutKnown_);
+            std::atomic_store_explicit(&voiceNames_, std::move(names), std::memory_order_release);
             if (!mu_->load_wave(romDir + "/dump"))
                 return fail("No se pudieron cargar las ondas: " + mu_->error());
 
@@ -209,6 +223,7 @@ public:
                 return fail("El firmware no terminó de iniciar. Revisá las ROMs.");
             booted_ = true;
             for (int i = 0; i < kEngineRate / 20; ++i) mu_->run_sample(left, right);
+            patches_.publish(mu_->nvram());
             if (cancelled_.load(std::memory_order_acquire))
                 return fail("Inicio cancelado.", State::stopped);
 
@@ -222,19 +237,15 @@ public:
             AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
             // Let the device choose its real rate; the MU2000 always runs at 44.1 kHz.
             AAudioStreamBuilder_setSampleRate(builder, AAUDIO_UNSPECIFIED);
-            AAudioStreamBuilder_setFramesPerDataCallback(builder, frames);
+            // Buffering and callback batching are different controls. The
+            // renderer already accepts variable frame counts; let AAudio
+            // deliver its native bursts instead of batching a whole buffer.
+            AAudioStreamBuilder_setFramesPerDataCallback(builder, AAUDIO_UNSPECIFIED);
             AAudioStreamBuilder_setBufferCapacityInFrames(builder, std::max(4096, frames * 2));
             if (deviceId > 0) AAudioStreamBuilder_setDeviceId(builder, deviceId);
             AAudioStreamBuilder_setDataCallback(builder, &Engine::dataCallback, this);
             AAudioStreamBuilder_setErrorCallback(builder, &Engine::errorCallback, this);
             result = AAudioStreamBuilder_openStream(builder, &stream_);
-            if (result == AAUDIO_ERROR_OUT_OF_RANGE) {
-                // MMAP devices can cap their buffer below our requested size.
-                // Let AAudio choose callback frames while keeping the requested
-                // buffering target. Diagnostics show the size actually received.
-                AAudioStreamBuilder_setFramesPerDataCallback(builder, AAUDIO_UNSPECIFIED);
-                result = AAudioStreamBuilder_openStream(builder, &stream_);
-            }
             AAudioStreamBuilder_delete(builder);
             if (result != AAUDIO_OK) return fail(audioError("Abrir salida", result));
             const int rate = AAudioStream_getSampleRate(stream_);
@@ -306,6 +317,107 @@ public:
         if (std::isfinite(value)) gain_.store(std::clamp(value, 0.0f, 1.0f));
     }
 
+    void detailedDiagnostics(bool enabled) {
+        const bool previous = detailedDiagnostics_.exchange(enabled, std::memory_order_acq_rel);
+        // The callback owns the recorder, including resets while playing.
+        // Starting a capture discards old warm-up peaks so a new test is useful.
+        if (enabled && !previous) diagnosticReset_.fetch_add(1, std::memory_order_release);
+    }
+
+    std::array<std::string, 2> currentSound(int channel, bool followProgramChanges) {
+        const int fallback = std::clamp(channel, 0, 15); // on-screen controls use port A
+        observedChannel_.store(fallback, std::memory_order_relaxed);
+        followPrograms_.store(followProgramChanges, std::memory_order_relaxed);
+        if (!running()) return {"Audio detenido", "Iniciá el motor para leer el sonido del firmware."};
+        const auto names = std::atomic_load_explicit(&voiceNames_, std::memory_order_acquire);
+        const int pcRoute = lastProgramRoute_.load(std::memory_order_relaxed);
+        const int route = followProgramChanges && pcRoute >= 0 ? pcRoute : fallback;
+        std::string title, details = "Puerto ";
+        details += char('A' + route / 16);
+        details += " · canal " + std::to_string(route % 16 + 1);
+        details += followProgramChanges && pcRoute >= 0
+                ? " · siguiendo Program Change" : " · canal de los controles";
+        if (!names || !names->ok())
+            return {"Nombre no disponible", details + "\nFirmware sin mapa de nombres reconocido."};
+        int matches = 0;
+        for (int part = 0; part < 64; ++part) {
+            const auto data = patches_.load(part);
+            if (!data.valid || data.receive_channel != route) continue;
+            std::string name = rimu2000::resolve_patch_name(data, *names);
+            if (name.empty()) name = "Nombre no disponible";
+            const std::string label = std::string(1, char('A' + part / 16)) + std::to_string(part % 16 + 1);
+            if (matches++) title += "\n";
+            title += label + " · " + name;
+            details += "\nParte " + label + " · programa " + std::to_string(int(data.program) + 1)
+                    + " · banco MSB " + std::to_string(data.bank_msb)
+                    + " / LSB " + std::to_string(data.bank_lsb);
+        }
+        if (!matches) return {"Sin parte receptora", details + "\nNinguna parte del firmware recibe en esa ruta."};
+        return {std::move(title), std::move(details)};
+    }
+
+    std::string callbackDiagnostics() const {
+        using Diagnostics = rimu2000::CallbackDiagnostics;
+        Diagnostics::Snapshot snapshot;
+        if (!callbackDiagnostics_.read(snapshot)) return "Actualizando el registro de bloques…";
+        const auto names = std::atomic_load_explicit(&voiceNames_, std::memory_order_acquire);
+        const auto percent = [](const Diagnostics::Sample& s) {
+            return s.frames > 0 && s.rate > 0 ? double(s.wallNs) * s.rate / (double(s.frames) * 10000000.0) : 0.0;
+        };
+        std::sort(snapshot.worst.begin(), snapshot.worst.begin() + snapshot.worstCount,
+                  [&](const auto& a, const auto& b) { return percent(a) > percent(b); });
+        std::string result = detailedDiagnostics_.load(std::memory_order_relaxed)
+                ? "Detalle de fallos de página/contextos activado."
+                : "Detalle de fallos de página/contextos desactivado; se conserva el registro básico.";
+        result += "\n8 mayores tiempos de trabajo / período. Un bloque >100% puede absorberse con el buffer."
+                  "\nLos 4 últimos incrementos de xruns se registran aparte; la notificación puede llegar después del corte."
+                  "\nVoces M/S: máximos observados por bloque, incluidas colas; no equivalen a teclas."
+                  "\nJIT: deltas de intentos, incluso los que terminan bien. Intervalo: entre inicios de callbacks.\n";
+        const auto append = [&](const Diagnostics::Sample& s) {
+            char line[1400];
+            std::snprintf(line, sizeof(line),
+                "\nt=%.3f s · #%llu · %d fr/%d Hz · %.1f%%\n"
+                "reloj %.3f ms / CPU %.3f ms · motor %.3f / conversión %.3f · intervalo %.3f ms\n"
+                "CPU %d→%d · MIDI %llu bytes · voces M/S %d/%d · xruns +%d (total %d)\n"
+                "JIT SH2 +%llu (fallos +%llu) · MEG M G/B +%llu/+%llu · S +%llu/+%llu",
+                double(s.sinceStartNs) / 1000000000.0, static_cast<unsigned long long>(s.sequence),
+                s.frames, s.rate, percent(s), double(s.wallNs) / 1000000.0, double(s.cpuNs) / 1000000.0,
+                double(s.coreNs) / 1000000.0, double(s.convertNs) / 1000000.0, double(s.startIntervalNs) / 1000000.0,
+                s.cpuStart, s.cpuEnd, static_cast<unsigned long long>(s.midiBytes), s.voicesMaster, s.voicesSlave,
+                s.xrunDelta, s.xrunTotal, static_cast<unsigned long long>(s.shCompileAttempts),
+                static_cast<unsigned long long>(s.shCompileFailures),
+                static_cast<unsigned long long>(s.masterBuildAttempts), static_cast<unsigned long long>(s.masterBakeAttempts),
+                static_cast<unsigned long long>(s.slaveBuildAttempts), static_cast<unsigned long long>(s.slaveBakeAttempts));
+            result += line;
+            if (s.rusageValid) {
+                std::snprintf(line, sizeof(line), "\nΔ minflt/majflt %llu/%llu · cambios invol./vol. %llu/%llu",
+                    static_cast<unsigned long long>(s.minorFaults), static_cast<unsigned long long>(s.majorFaults),
+                    static_cast<unsigned long long>(s.involuntarySwitches), static_cast<unsigned long long>(s.voluntarySwitches));
+                result += line;
+            } else {
+                result += "\nFallos de página/contextos: sin captura";
+                if (s.rusageError) result += " (errno " + std::to_string(s.rusageError) + ")";
+            }
+            if (s.patchPart >= 0) {
+                const auto data = rimu2000::PatchSnapshot::unpack(s.patchWord, s.patchPart);
+                const auto name = names ? rimu2000::resolve_patch_name(data, *names) : std::string{};
+                result += "\nParte observada " + std::string(1, char('A' + s.patchPart / 16))
+                        + std::to_string(s.patchPart % 16 + 1) + " · " + (name.empty() ? "nombre no disponible" : name)
+                        + " · programa " + std::to_string(int(data.program) + 1)
+                        + " · MSB/LSB " + std::to_string(data.bank_msb) + "/" + std::to_string(data.bank_lsb);
+            }
+            result += "\n";
+        };
+        result += "\nBLOQUES MÁS LENTOS\n";
+        for (std::size_t i = 0; i < snapshot.worstCount; ++i) append(snapshot.worst[i]);
+        result += "\nÚLTIMOS INCREMENTOS DE XRUNS\n";
+        if (!snapshot.xrunCount) result += "Ninguno registrado.\n";
+        for (std::size_t i = 0; i < snapshot.xrunCount; ++i) append(snapshot.xruns[i]);
+        result += "\nEstos datos indican coincidencias, no causas: un fallo de página no identifica la memoria afectada; "
+                  "CPU inicial=final no excluye migraciones intermedias. Para una captura nueva, apagá y encendé Detalle de cortes.";
+        return result;
+    }
+
     // No engine/stream access or control lock here: safe on the UI thread even
     // while start is loading ROMs or stop is joining the callback.
     std::string stats() const {
@@ -364,10 +476,11 @@ public:
             const auto flags = shJit_.flags.load(std::memory_order_relaxed);
             char sh[256];
             std::snprintf(sh, sizeof(sh),
-                "SH2 JIT %s ciclos · %s · nativo %s · listo %s · fallos %llu (mem %llu) errno%d",
+                "SH2 JIT %s ciclos · %s · nativo %s · listo %s · compila %llu · fallos %llu (mem %llu) errno%d",
                 percentage(shJit_.jit.load(), shJit_.work.load()).c_str(),
                 (flags & 1) ? "ON" : "OFF", (flags & 2) ? "sí" : "no",
                 (flags & 4) ? "sí" : "no",
+                static_cast<unsigned long long>(shJit_.compilations.load()),
                 static_cast<unsigned long long>(shJit_.failures.load()),
                 static_cast<unsigned long long>(shJit_.allocationFailures.load()), shJit_.error.load());
             jitText = std::string(sh) + "\n" + megDescription(masterJit_, "M") +
@@ -378,8 +491,8 @@ public:
             "%s · %s %.2f s: render %.1f%% (máx %.1f%%)\n"
             "Bloque %.2f ms reloj / %.2f ms CPU / %.2f ms disponibles · motor %.1f%% + conversión %.1f%%\n"
             "Total render %.1f%% (máx %.1f%%) · CPU hilo %.1f%% / app %.1f%% (100%% = 1 núcleo)\n"
-            "Xruns %d · tarde reciente %llu/%llu · total %llu/%llu\n"
-            "44100 → %d Hz · callback %d fr (pedido %d) · buffer real %d fr · ráfaga %d · sinc64 fases %d\n"
+            "Xruns %d · bloques > período: reciente %llu/%llu · total %llu/%llu\n"
+            "44100 → %d Hz · callback Android %d fr · buffer pedido %d / real %d fr · ráfaga %d · sinc64 fases %d\n"
             "MIDI %llu bytes · descartados %llu · pendientes %llu · salida ID %d\n"
             "Hilo %d · CPU #%d · vistas %s · %s%s prioridad %d · AAudio %s/%s\n"
             "ADPF %s · informes %llu · omitidos %llu · error %d\n"
@@ -405,7 +518,15 @@ public:
             nvramWarning_.load() ? "\nNo se pudieron guardar los ajustes de la sesión." : "");
         // Concatenate after formatting so even a large, sparse CPU mask is not
         // silently cut to the fixed buffer used for the other diagnostics.
-        return std::string(out) + "\n" + cpuPlacement_.describe();
+        std::string result = std::string(out) + "\nVoces activas M/S " + std::to_string(voicesMaster_.load()) + "/"
+                + std::to_string(voicesSlave_.load()) + " · máximos observados "
+                + std::to_string(peakVoicesMaster_.load()) + "/" + std::to_string(peakVoicesSlave_.load())
+                + " (incluyen colas)\nCompila: intentos en la ventana reciente; fallos: acumulados.\n"
+                + cpuPlacement_.describe();
+        const int xrunError = xrunError_.load(std::memory_order_relaxed);
+        if (xrunError < 0) result += "\nXruns: último total válido; consulta actual no disponible (error "
+                + std::to_string(xrunError) + ").";
+        return result;
     }
 
 private:
@@ -477,6 +598,7 @@ private:
     void resetStatistics() {
         frames_.store(0); elapsedNs_.store(0); callbacks_.store(0); late_.store(0);
         maxPercent_.store(0); xruns_.store(0); dropped_.store(0); midiReceived_.store(0);
+        xrunError_.store(0);
         internalDropped_.store(0); pendingMidi_.store(0); observedFrames_.store(0);
         rate_.store(0); actualBuffer_.store(0); burst_.store(0); device_.store(0);
         resamplerPhases_.store(0);
@@ -490,10 +612,18 @@ private:
         jitBaseline_ = false;
         jitPublished_.store(false);
         shJit_.reset(); masterJit_.reset(); slaveJit_.reset();
+        programTracker_.reset();
+        lastProgramRoute_.store(-1);
+        lastPatchTime_ = previousCallbackBegin_ = 0;
+        callbackDiagnostics_.reset();
+        seenDiagnosticReset_ = diagnosticReset_.load(std::memory_order_relaxed);
+        voicesMaster_.store(0); voicesSlave_.store(0);
+        peakVoicesMaster_.store(0); peakVoicesSlave_.store(0);
     }
 
     void sendPanic() {
         midi_.discard();
+        programTracker_.reset();
         // A stopped/truncated SysEx must not swallow the channel messages.
         for (int port = 0; port < 4; ++port) {
             mu_->midi_in(0xf7, port);
@@ -527,6 +657,7 @@ private:
         shJit_.failures.store(sh.compile_failures);
         shJit_.allocationFailures.store(sh.allocation_failures);
         shJit_.error.store(sh.last_errno);
+        shJit_.compilations.store(elapsedSince(previousShJit_.compile_attempts, sh.compile_attempts));
         previousShJit_ = sh;
         const auto publishMeg = [](const swp30_device::jit_statistics& current,
                                    swp30_device::jit_statistics& previous, PublishedJit& output) {
@@ -541,6 +672,8 @@ private:
             output.failures.store(current.build_failures);
             output.bakedFailures.store(current.baked_build_failures);
             output.error.store(current.last_errno);
+            output.compilations.store(elapsedSince(previous.build_attempts, current.build_attempts));
+            output.bakedCompilations.store(elapsedSince(previous.baked_build_attempts, current.baked_build_attempts));
             previous = current;
         };
         publishMeg(mu_->swpm().meg_jit_stats(), previousMasterJit_, masterJit_);
@@ -555,15 +688,30 @@ private:
 
     aaudio_data_callback_result_t render(AAudioStream* stream, float* output, int count) {
         if (count <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
+        const auto begin = clockNs(CLOCK_MONOTONIC);
+        const auto cpuBegin = clockNs(CLOCK_THREAD_CPUTIME_ID);
+        const int firstCpu = sched_getcpu();
         if (!running_.load(std::memory_order_acquire) || cancelled_.load(std::memory_order_acquire)) {
             std::fill_n(output, std::size_t(count) * 2, 0.0f);
             cpuPlacement_.restoreCurrentThread();
             return AAUDIO_CALLBACK_RESULT_STOP;
         }
+        const auto reset = diagnosticReset_.load(std::memory_order_acquire);
+        if (reset != seenDiagnosticReset_) {
+            callbackDiagnostics_.reset();
+            seenDiagnosticReset_ = reset;
+        }
+        const bool detailed = detailedDiagnostics_.load(std::memory_order_acquire);
+        rusage usageBefore{}, usageAfter{};
+        bool usageCaptured = false;
+        int usageError = 0;
+        if (detailed) {
+            usageCaptured = getrusage(RUSAGE_THREAD, &usageBefore) == 0;
+            if (!usageCaptured) usageError = errno;
+        }
         if (!jitBaseline_) beginJitWindow();
         const int tid = gettid();
         cpuPlacement_.enterAudioThread(tid);
-        const int firstCpu = sched_getcpu();
         if (audioTid_.load(std::memory_order_relaxed) != tid ||
             (callbacks_.load(std::memory_order_relaxed) & 31) == 0) {
             audioTid_.store(tid, std::memory_order_relaxed);
@@ -572,10 +720,14 @@ private:
             if (sched_getparam(0, &parameters) == 0)
                 priority_.store(parameters.sched_priority, std::memory_order_relaxed);
         }
-        const auto begin = clockNs(CLOCK_MONOTONIC);
-        const auto cpuBegin = clockNs(CLOCK_THREAD_CPUTIME_ID);
-        auto boundary = begin;
+        const auto shBefore = mu_->cpu().jit_stats();
+        const auto masterBefore = mu_->swpm().meg_jit_stats();
+        const auto slaveBefore = mu_->swps().meg_jit_stats();
+        int voicesMaster = mu_->swpm().sounding_voices(), voicesSlave = mu_->swps().sounding_voices();
+        int peakMaster = voicesMaster, peakSlave = voicesSlave;
+        auto boundary = clockNs(CLOCK_MONOTONIC);
         std::uint64_t coreElapsed = 0, conversionElapsed = 0;
+        std::uint64_t receivedBytes = 0;
         try {
             for (int done = 0; done < count; ) {
                 if (panic_.exchange(false, std::memory_order_acq_rel)) sendPanic();
@@ -584,8 +736,13 @@ private:
                 // work precedes a panic message inside the firmware.
                 const auto pending = mu_->midi_pending();
                 const std::size_t allowance = pending < 2048 ? 2048 - pending : 0;
-                const auto received = midi_.consume(allowance, [&](u8 byte, u8 port) { mu_->midi_in(byte, port); });
+                const auto received = midi_.consume(allowance, [&](u8 byte, u8 port) {
+                    mu_->midi_in(byte, port);
+                    const int route = programTracker_.feed(byte, port);
+                    if (route >= 0) lastProgramRoute_.store(route, std::memory_order_relaxed);
+                });
                 midiReceived_.fetch_add(received, std::memory_order_relaxed);
+                receivedBytes += received;
                 const int chunk = std::min(kRenderChunk, count - done);
                 const int need = resampler_.input_needed(chunk);
                 if (need < 0 || need > kStagingFrames) throw std::runtime_error("Resampler capacity");
@@ -596,6 +753,10 @@ private:
                     staging_[i * 2] = s16(std::clamp(l >> 2, -32768, 32767));
                     staging_[i * 2 + 1] = s16(std::clamp(r >> 2, -32768, 32767));
                 }
+                voicesMaster = mu_->swpm().sounding_voices();
+                voicesSlave = mu_->swps().sounding_voices();
+                peakMaster = std::max(peakMaster, voicesMaster);
+                peakSlave = std::max(peakSlave, voicesSlave);
                 const auto coreEnd = clockNs(CLOCK_MONOTONIC);
                 coreElapsed += elapsedSince(boundary, coreEnd);
                 resampler_.push(staging_.data(), need);
@@ -613,10 +774,74 @@ private:
             cpuPlacement_.restoreCurrentThread();
             return AAUDIO_CALLBACK_RESULT_STOP;
         }
+        voicesMaster_.store(voicesMaster, std::memory_order_relaxed);
+        voicesSlave_.store(voicesSlave, std::memory_order_relaxed);
+        if (peakMaster > peakVoicesMaster_.load(std::memory_order_relaxed)) peakVoicesMaster_.store(peakMaster);
+        if (peakSlave > peakVoicesSlave_.load(std::memory_order_relaxed)) peakVoicesSlave_.store(peakSlave);
+        if (!lastPatchTime_ || elapsedSince(lastPatchTime_, boundary) >= kPatchWindowNs) {
+            patches_.publish(mu_->nvram());
+            lastPatchTime_ = boundary;
+        }
+        rimu2000::CallbackDiagnostics::Sample sample;
+        sample.sequence = callbacks_.load(std::memory_order_relaxed) + 1;
+        sample.sinceStartNs = elapsedSince(startTime_.load(std::memory_order_relaxed), begin);
+        sample.frames = count;
+        sample.rate = rate_.load(std::memory_order_relaxed);
+        sample.coreNs = coreElapsed;
+        sample.convertNs = conversionElapsed;
+        sample.startIntervalNs = previousCallbackBegin_ ? elapsedSince(previousCallbackBegin_, begin) : 0;
+        previousCallbackBegin_ = begin;
+        sample.midiBytes = receivedBytes;
+        sample.voicesMaster = peakMaster;
+        sample.voicesSlave = peakSlave;
+        const auto shAfter = mu_->cpu().jit_stats();
+        const auto masterAfter = mu_->swpm().meg_jit_stats();
+        const auto slaveAfter = mu_->swps().meg_jit_stats();
+        sample.shCompileAttempts = elapsedSince(shBefore.compile_attempts, shAfter.compile_attempts);
+        sample.shCompileFailures = elapsedSince(shBefore.compile_failures, shAfter.compile_failures);
+        sample.masterBuildAttempts = elapsedSince(masterBefore.build_attempts, masterAfter.build_attempts);
+        sample.masterBakeAttempts = elapsedSince(masterBefore.baked_build_attempts, masterAfter.baked_build_attempts);
+        sample.slaveBuildAttempts = elapsedSince(slaveBefore.build_attempts, slaveAfter.build_attempts);
+        sample.slaveBakeAttempts = elapsedSince(slaveBefore.baked_build_attempts, slaveAfter.baked_build_attempts);
+        sample.midiRoute = observedChannel_.load(std::memory_order_relaxed);
+        const int lastProgram = lastProgramRoute_.load(std::memory_order_relaxed);
+        if (followPrograms_.load(std::memory_order_relaxed) && lastProgram >= 0) sample.midiRoute = lastProgram;
+        // Identify one observed receiving part, not every part that contributes
+        // to the mix. Save its actual firmware state, not a later UI snapshot.
+        for (int part = 0; patchLayoutKnown_ && part < 64; ++part) {
+            const auto data = rimu2000::PatchSnapshot::capturePart(mu_->nvram(), part, true);
+            if (!data.valid || data.receive_channel != sample.midiRoute) continue;
+            sample.patchPart = part;
+            sample.patchWord = rimu2000::PatchSnapshot::pack(data);
+            break;
+        }
+        const int previousXruns = xruns_.load(std::memory_order_relaxed);
+        const int queriedXruns = AAudioStream_getXRunCount(stream);
+        // A transient API error is not a counter reset. Retain the previous
+        // total so recovery cannot fabricate a new batch of xruns.
+        xrunError_.store(queriedXruns < 0 ? queriedXruns : 0, std::memory_order_relaxed);
+        sample.xrunTotal = queriedXruns >= 0 ? queriedXruns : previousXruns;
+        sample.xrunDelta = queriedXruns >= 0 ? std::max(0, queriedXruns - previousXruns) : 0;
+        if (detailed && usageCaptured) {
+            sample.rusageValid = getrusage(RUSAGE_THREAD, &usageAfter) == 0;
+            if (!sample.rusageValid) usageError = errno;
+            if (sample.rusageValid) {
+                sample.minorFaults = elapsedSince(usageBefore.ru_minflt, usageAfter.ru_minflt);
+                sample.majorFaults = elapsedSince(usageBefore.ru_majflt, usageAfter.ru_majflt);
+                sample.involuntarySwitches = elapsedSince(usageBefore.ru_nivcsw, usageAfter.ru_nivcsw);
+                sample.voluntarySwitches = elapsedSince(usageBefore.ru_nvcsw, usageAfter.ru_nvcsw);
+            }
+        }
+        sample.rusageError = usageError;
         const auto end = clockNs(CLOCK_MONOTONIC);
         const auto elapsed = elapsedSince(begin, end);
         const auto cpuElapsed = elapsedSince(cpuBegin, clockNs(CLOCK_THREAD_CPUTIME_ID));
         const int finalCpu = sched_getcpu();
+        sample.wallNs = elapsed;
+        sample.cpuNs = cpuElapsed;
+        sample.cpuStart = firstCpu;
+        sample.cpuEnd = finalCpu;
+        callbackDiagnostics_.record(sample);
         lastCpu_.store(finalCpu, std::memory_order_relaxed);
         cpuPlacement_.observeCpu(finalCpu);
         std::uint64_t observedCpus = 0;
@@ -638,7 +863,7 @@ private:
         pendingMidi_.store(mu_->midi_pending(), std::memory_order_relaxed);
         frames_.fetch_add(std::uint64_t(count), std::memory_order_relaxed);
         callbacks_.fetch_add(1, std::memory_order_relaxed);
-        xruns_.store(std::max(0, AAudioStream_getXRunCount(stream)), std::memory_order_relaxed);
+        xruns_.store(sample.xrunTotal, std::memory_order_relaxed);
         if (!window_.started) window_.started = begin;
         window_.span = elapsedSince(window_.started, end);
         window_.frames += std::uint64_t(count);
@@ -679,6 +904,17 @@ private:
     rimu2000::MidiQueue midi_;
     rimu2000::PerformanceHint performanceHint_;
     rimu2000::AudioCpuPlacement cpuPlacement_;
+    rimu2000::PatchSnapshot patches_;
+    rimu2000::ProgramChangeTracker programTracker_;
+    rimu2000::CallbackDiagnostics callbackDiagnostics_;
+    // Immutable ROM ownership is shared only by control/UI, never acquired in RT.
+    std::shared_ptr<const xg::voice_rom> voiceNames_;
+    bool patchLayoutKnown_ = false; // fixed before stream start
+    std::uint64_t lastPatchTime_ = 0, previousCallbackBegin_ = 0, seenDiagnosticReset_ = 0;
+    std::atomic<std::uint64_t> diagnosticReset_{0};
+    std::atomic<bool> detailedDiagnostics_{false}, followPrograms_{true};
+    std::atomic<int> lastProgramRoute_{-1}, observedChannel_{0};
+    std::atomic<int> voicesMaster_{0}, voicesSlave_{0}, peakVoicesMaster_{0}, peakVoicesSlave_{0};
     TimingWindow window_;
     PublishedWindow recent_;
     bool jitBaseline_ = false; // callback-owned; reset only after close
@@ -692,7 +928,7 @@ private:
     std::atomic<State> state_{State::stopped};
     std::atomic<float> gain_{0.8f}, maxPercent_{0};
     std::atomic<int> rate_{0}, requestedFrames_{1024}, observedFrames_{0}, actualBuffer_{0}, burst_{0}, device_{0}, xruns_{0};
-    std::atomic<int> resamplerPhases_{0};
+    std::atomic<int> resamplerPhases_{0}, xrunError_{0};
     std::atomic<int> audioTid_{0}, lastCpu_{-1}, policy_{-1}, priority_{0},
         performanceMode_{AAUDIO_PERFORMANCE_MODE_NONE}, sharingMode_{AAUDIO_SHARING_MODE_SHARED};
     std::atomic<std::uint64_t> frames_{0}, elapsedNs_{0}, callbacks_{0}, late_{0}, dropped_{0},
@@ -733,6 +969,34 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_rinoize_rimu2000_NativeEngine_stats(JNIEnv* env, jclass) {
     const auto text = engine().stats();
     return env->NewStringUTF(text.c_str());
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_rinoize_rimu2000_NativeEngine_currentSound(JNIEnv* env, jclass, jint channel, jboolean follow) {
+    const auto sound = engine().currentSound(channel, follow == JNI_TRUE);
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (!stringClass) return nullptr;
+    jobjectArray result = env->NewObjectArray(2, stringClass, nullptr);
+    env->DeleteLocalRef(stringClass);
+    if (!result) return nullptr;
+    for (int i = 0; i < 2; ++i) {
+        jstring item = env->NewStringUTF(sound[i].c_str());
+        if (!item) return result;
+        env->SetObjectArrayElement(result, i, item);
+        env->DeleteLocalRef(item);
+    }
+    return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_rimu2000_NativeEngine_callbackDiagnostics(JNIEnv* env, jclass) {
+    const auto text = engine().callbackDiagnostics();
+    return env->NewStringUTF(text.c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_rinoize_rimu2000_NativeEngine_setDetailedDiagnostics(JNIEnv*, jclass, jboolean enabled) {
+    engine().detailedDiagnostics(enabled == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL

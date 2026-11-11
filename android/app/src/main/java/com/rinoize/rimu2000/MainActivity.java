@@ -3,6 +3,7 @@ package com.rinoize.rimu2000;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
@@ -36,6 +37,7 @@ import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
 import java.io.IOException;
@@ -52,6 +54,7 @@ public final class MainActivity extends Activity {
     private static final int BG = 0xff0c121c, CARD = 0xff151f2c;
     private static final int INK = 0xffe6edf5, MUTED = 0xffa0afc1, ACCENT = 0xff7fd5ff;
     private static final int[] BUFFERS = {512, 1024, 2048};
+    private static final String APP_VERSION = "0.1.3";
 
     private final Handler main = new Handler(Looper.getMainLooper());
     // Shared across Activity instances so a retiring screen cannot stop a new
@@ -72,10 +75,13 @@ public final class MainActivity extends Activity {
     private final List<AudioChoice> audioChoices = new ArrayList<>();
 
     private TextView status, diagnostics, romStatus, midiStatus, gainLabel;
+    private TextView soundName, soundDetails, callbackTrace;
     private Button start, stop, panic, importFiles, importFolder, connectMidi, refreshMidi, applyProgram;
+    private Button copyDiagnostics;
     private Spinner outputPicker, bufferPicker, cpuPicker, midiPicker, channelPicker;
     private EditText bankMsb, bankLsb, program;
-    private Switch sustain;
+    private Switch sustain, followProgramChanges, detailedDiagnostics;
+    private LinearLayout cutDetails;
     private KeyboardView keyboard;
     private SeekBar gain;
 
@@ -106,12 +112,23 @@ public final class MainActivity extends Activity {
                 }
                 running = active;
                 diagnostics.setText(NativeEngine.stats());
+                refreshCallbackDiagnostics();
                 updateControls();
             }
             if (midi != null && midi.isConnected()) {
                 midiStatus.setText(midiConnectionText + midi.diagnostics());
             }
             main.postDelayed(this, 1000);
+        }
+    };
+
+    // Sound state follows actual firmware changes independently of the slower
+    // performance panel. This never changes routing, draft fields, or MIDI.
+    private final Runnable soundPoll = new Runnable() {
+        @Override public void run() {
+            if (destroyed || !visible) return;
+            refreshCurrentSound();
+            main.postDelayed(this, 250);
         }
     };
 
@@ -164,11 +181,14 @@ public final class MainActivity extends Activity {
         }
         main.removeCallbacks(poll);
         main.post(poll);
+        main.removeCallbacks(soundPoll);
+        main.post(soundPoll);
     }
 
     @Override protected void onStop() {
         visible = false;
         main.removeCallbacks(poll);
+        main.removeCallbacks(soundPoll);
         midi.pause();
         midiStatus.setText("MIDI desconectado. Elegí el puerto y tocá Conectar.");
         connectMidi.setText("Conectar");
@@ -223,7 +243,7 @@ public final class MainActivity extends Activity {
         TextView title = text("RiMU2000", 30, INK);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         content.addView(title);
-        content.addView(text("YAMAHA MU2000 · MOTOR S-MU2000 · ALPHA 0.1.2", 11, MUTED));
+        content.addView(text("YAMAHA MU2000 · MOTOR S-MU2000 · ALPHA " + APP_VERSION, 11, MUTED));
 
         LinearLayout display = card(content, 0xff0d2b43);
         TextView displayTitle = text("MU2000  /  ANDROID", 13, ACCENT);
@@ -232,10 +252,28 @@ public final class MainActivity extends Activity {
         status = text("Importá las ROMs, conectá tu teclado e iniciá el audio.", 17, INK);
         status.setPadding(0, dp(8), 0, dp(10));
         display.addView(status);
-        diagnostics = text("Motor ARM64 · firmware original · 44,1 kHz internos", 12, ACCENT);
-        diagnostics.setTypeface(Typeface.MONOSPACE);
-        diagnostics.setTextIsSelectable(true);
-        display.addView(diagnostics);
+        heading(display, "SONIDO ACTUAL");
+        soundName = text("Iniciá el audio para consultar el sonido.", 23, INK);
+        soundName.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        soundName.setTextIsSelectable(true);
+        display.addView(soundName);
+        soundDetails = text("El nombre y el banco se leen del estado del MU2000.", 12, ACCENT);
+        soundDetails.setTextIsSelectable(true);
+        soundDetails.setPadding(0, dp(5), 0, dp(8));
+        display.addView(soundDetails);
+        followProgramChanges = new Switch(this);
+        followProgramChanges.setText("Seguir Program Change");
+        followProgramChanges.setTextColor(INK);
+        followProgramChanges.setTextSize(14);
+        followProgramChanges.setMinHeight(dp(48));
+        followProgramChanges.setChecked(preferences.getBoolean("follow_program_changes", true));
+        display.addView(followProgramChanges);
+        display.addView(text("Observa la ruta del último cambio de programa recibido. "
+                + "Los controles en pantalla usan el canal elegido abajo.", 11, MUTED));
+        followProgramChanges.setOnCheckedChangeListener((button, checked) -> {
+            preferences.edit().putBoolean("follow_program_changes", checked).apply();
+            refreshCurrentSound();
+        });
         LinearLayout transport = row();
         display.addView(transport);
         start = button("Iniciar", v -> startAudio());
@@ -243,6 +281,46 @@ public final class MainActivity extends Activity {
         stop = button("Detener", v -> requestStop("Audio detenido."));
         panic = button("Panic", v -> { releaseNotes(); NativeEngine.panic(); });
         weighted(transport, start, 1); weighted(transport, stop, 1); weighted(transport, panic, 1);
+        diagnostics = text("Motor ARM64 · firmware original · 44,1 kHz internos", 12, ACCENT);
+        diagnostics.setTypeface(Typeface.MONOSPACE);
+        diagnostics.setTextIsSelectable(true);
+        diagnostics.setPadding(0, dp(10), 0, dp(6));
+        display.addView(diagnostics);
+        LinearLayout diagnosticActions = row(); display.addView(diagnosticActions);
+        detailedDiagnostics = new Switch(this);
+        detailedDiagnostics.setText("Detalle de cortes");
+        detailedDiagnostics.setTextColor(INK);
+        detailedDiagnostics.setTextSize(13);
+        detailedDiagnostics.setMinHeight(dp(48));
+        detailedDiagnostics.setChecked(false);
+        copyDiagnostics = button("Copiar diagnóstico", v -> copyDiagnostics());
+        weighted(diagnosticActions, detailedDiagnostics, 1);
+        weighted(diagnosticActions, copyDiagnostics, 1);
+        display.addView(text("Activar detalle reinicia el registro; copialo antes si querés conservarlo.",
+                11, MUTED));
+        cutDetails = column();
+        cutDetails.setVisibility(View.GONE);
+        display.addView(cutDetails);
+        TextView detailHelp = text("Al activar se inicia un registro nuevo de los 8 bloques más lentos "
+                + "y de los últimos 4 incrementos de xruns, con datos de planificación. "
+                + "Copiar diagnóstico incluye los registros disponibles aunque esta sección esté cerrada.",
+                11, MUTED);
+        detailHelp.setPadding(0, dp(4), 0, dp(8));
+        cutDetails.addView(detailHelp);
+        callbackTrace = text("Todavía no hay registros de audio.", 11, ACCENT);
+        callbackTrace.setTypeface(Typeface.MONOSPACE);
+        callbackTrace.setTextIsSelectable(true);
+        ScrollView traceScroll = new ScrollView(this);
+        traceScroll.setNestedScrollingEnabled(true);
+        traceScroll.addView(callbackTrace);
+        cutDetails.addView(traceScroll, new LinearLayout.LayoutParams(-1, dp(220)));
+        detailedDiagnostics.setOnCheckedChangeListener((button, checked) -> {
+            cutDetails.setVisibility(checked ? View.VISIBLE : View.GONE);
+            if (NativeEngine.LOAD_ERROR == null) NativeEngine.setDetailedDiagnostics(checked);
+            if (checked) refreshCallbackDiagnostics();
+        });
+        // This instrumentation is opt-in per Activity, not a saved preference.
+        if (NativeEngine.LOAD_ERROR == null) NativeEngine.setDetailedDiagnostics(false);
 
         LinearLayout routing = card(content, CARD);
         heading(routing, "AUDIO");
@@ -253,7 +331,7 @@ public final class MainActivity extends Activity {
         LinearLayout bufferCol = labelled(audioRow, "Buffer solicitado", 2);
         bufferPicker = spinner(); bufferCol.addView(bufferPicker);
         setItems(bufferPicker, new String[]{"512 frames", "1024 frames", "2048 frames"});
-        int savedBuffer = preferences.getInt("buffer", 1024);
+        int savedBuffer = preferences.getInt("buffer", 2048);
         bufferPicker.setSelection(savedBuffer == 512 ? 0 : savedBuffer == 2048 ? 2 : 1);
         TextView cpuLabel = text("CPU del motor", 11, MUTED);
         cpuLabel.setPadding(0, dp(8), 0, 0);
@@ -262,7 +340,10 @@ public final class MainActivity extends Activity {
         cpuPicker.setPrompt("CPU del motor");
         setItems(cpuPicker, new String[]{"Automático (Android)", "Núcleos de rendimiento"});
         cpuPicker.setSelection(preferences.getInt("cpu_mode", 0) == 1 ? 1 : 0);
-        TextView audioHelp = text("Empezá con 1024. El diagnóstico muestra el buffer que Android aceptó. "
+        TextView audioHelp = text("Empezá con 2048; si va estable, probá 1024. "
+                + "Este selector pide el tamaño del buffer de salida. "
+                + "Android elige por separado el tamaño de cada bloque de audio (callback); "
+                + "el diagnóstico muestra ambos valores reales. Si hay cortes, probá 2048. "
                 + "Si el render supera el 100 %, probá Núcleos de rendimiento. "
                 + "Para cambiar la salida, el buffer o la CPU, detené el audio.", 12, MUTED);
         audioHelp.setPadding(0, dp(7), 0, 0);
@@ -323,11 +404,13 @@ public final class MainActivity extends Activity {
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
                 releaseNotes();
                 uiChannel = position;
+                refreshCurrentSound();
             }
             public void onNothingSelected(AdapterView<?> parent) {}
         });
         voice.addView(text("MSB/LSB: 0–127 · Programa: 1–128. El canal afecta solo estos controles; "
-                + "la entrada USB conserva su canal.", 12, MUTED));
+                + "la entrada USB conserva su canal. Estos valores se envían con Aplicar sonido; "
+                + "el sonido confirmado aparece arriba.", 12, MUTED));
         keyboard = new KeyboardView(this, new KeyboardView.Notes() {
             public void on(int note) { send(0x90 | uiChannel, note, 100); }
             public void off(int note) { send(0x80 | uiChannel, note, 0); }
@@ -357,7 +440,7 @@ public final class MainActivity extends Activity {
 
     private void showLicenses() {
         worker.execute(() -> {
-            StringBuilder contents = new StringBuilder("RiMU2000 Android · alpha 0.1.2\n\n")
+            StringBuilder contents = new StringBuilder("RiMU2000 Android · alpha " + APP_VERSION + "\n\n")
                     .append("Adaptación para Android del proyecto S-MU2000 de tarboh.\n")
                     .append("Proyecto no oficial, sin relación con Yamaha.\n\n")
                     .append("Código fuente del port:\nhttps://github.com/RiNoize/RiMU2000-Android\n\n")
@@ -411,6 +494,8 @@ public final class MainActivity extends Activity {
         preferences.edit().putInt("buffer", frames).putInt("cpu_mode", cpuMode).apply();
         busy = true; starting = true;
         status.setText("Iniciando el MU2000… la primera carga puede tardar unos segundos.");
+        soundName.setText("Iniciando el MU2000…");
+        soundDetails.setText("El sonido se mostrará cuando el firmware esté listo.");
         updateControls();
         NativeEngine.setGain(gain.getProgress() / 100f);
         worker.execute(() -> {
@@ -439,6 +524,8 @@ public final class MainActivity extends Activity {
                     abandonFocus();
                 }
                 diagnostics.setText(NativeEngine.stats());
+                refreshCurrentSound();
+                refreshCallbackDiagnostics();
                 updateControls();
             });
         });
@@ -460,6 +547,8 @@ public final class MainActivity extends Activity {
                 if (destroyed || request != generation) return;
                 busy = false; running = false;
                 diagnostics.setText(NativeEngine.stats());
+                refreshCurrentSound();
+                refreshCallbackDiagnostics();
                 refreshRoms();
                 updateControls();
             });
@@ -467,6 +556,58 @@ public final class MainActivity extends Activity {
     }
 
     private void abandonFocus() { if (audio != null && focus != null) audio.abandonAudioFocusRequest(focus); }
+
+    private String[] readCurrentSound() {
+        String[] snapshot = NativeEngine.currentSound(uiChannel, followProgramChanges.isChecked());
+        String names = snapshot != null && snapshot.length > 0 && snapshot[0] != null
+                && !snapshot[0].isEmpty() ? snapshot[0] : "Nombre no disponible";
+        String details = snapshot != null && snapshot.length > 1 && snapshot[1] != null
+                ? snapshot[1] : "";
+        return new String[]{names, details};
+    }
+
+    private void refreshCurrentSound() {
+        if (destroyed || !visible || busy || soundName == null || followProgramChanges == null
+                || NativeEngine.LOAD_ERROR != null) return;
+        String[] snapshot = readCurrentSound();
+        setTextIfChanged(soundName, snapshot[0]);
+        setTextIfChanged(soundDetails, snapshot[1]);
+    }
+
+    private void refreshCallbackDiagnostics() {
+        if (destroyed || callbackTrace == null || detailedDiagnostics == null
+                || !detailedDiagnostics.isChecked() || NativeEngine.LOAD_ERROR != null) return;
+        String trace = NativeEngine.callbackDiagnostics();
+        setTextIfChanged(callbackTrace, trace == null || trace.isEmpty()
+                ? "Todavía no hay registros de audio." : trace);
+    }
+
+    private void copyDiagnostics() {
+        if (destroyed || !visible || NativeEngine.LOAD_ERROR != null) return;
+        String[] sound = readCurrentSound();
+        String stats = NativeEngine.stats();
+        String trace = NativeEngine.callbackDiagnostics();
+        String report = "RiMU2000 Android · alpha " + APP_VERSION
+                + "\n\nSONIDO ACTUAL\n" + sound[0] + "\n" + sound[1]
+                + "\nSeguimiento de Program Change: " + (followProgramChanges.isChecked() ? "sí" : "no")
+                + "\nControles en pantalla: puerto A, canal " + (uiChannel + 1)
+                + "\n\nESTADO DEL AUDIO\n" + (stats == null ? "No disponible" : stats)
+                + "\n\nBLOQUES DE AUDIO REGISTRADOS\n" + (trace == null ? "No disponibles" : trace)
+                + "\n\nENTRADA MIDI\n" + midiStatus.getText();
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboard == null) {
+            Toast.makeText(this, "No se pudo acceder al portapapeles.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        clipboard.setPrimaryClip(ClipData.newPlainText("Diagnóstico RiMU2000", report));
+        // Android 13+ provides its own confirmation for clipboard writes.
+        if (Build.VERSION.SDK_INT < 33)
+            Toast.makeText(this, "Diagnóstico copiado.", Toast.LENGTH_SHORT).show();
+    }
+
+    private void setTextIfChanged(TextView view, String value) {
+        if (!value.contentEquals(view.getText())) view.setText(value);
+    }
 
     private void releaseNotes() {
         if (keyboard != null) keyboard.releaseAll();
@@ -628,6 +769,9 @@ public final class MainActivity extends Activity {
         keyboard.setEnabled(available && running);
         sustain.setEnabled(available && running);
         gain.setEnabled(available);
+        followProgramChanges.setEnabled(available);
+        detailedDiagnostics.setEnabled(available);
+        copyDiagnostics.setEnabled(available);
         if (running || busy) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
