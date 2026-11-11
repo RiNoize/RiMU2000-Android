@@ -24,8 +24,13 @@ public final class NativeEngine {
     public static native void panic();
     public static native void setGain(float gain);
     public static native String stats();
-    /** Snapshot of firmware state: [voice names, part/bank/program/routing details]. */
+    /** Firmware snapshot: [voice names, readable details, structured state JSON]. */
     public static native String[] currentSound(int channel, boolean followProgramChanges);
+    /** Cached ROM catalog JSON; call from a worker, never from the audio thread. */
+    public static native String voiceCatalog();
+    /** Selects a catalog entry on port A; empty means queued, RAM confirms the result. */
+    public static native String selectVoice(String catalogKey, int msb, int lsb, int program,
+                                          int kind, int channel);
     /** The retained slow callbacks; safe to read while audio is running or stopped. */
     public static native String callbackDiagnostics();
     /** Enabling starts a fresh capture with scheduling detail; disabling retains records. */

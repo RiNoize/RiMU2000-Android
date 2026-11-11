@@ -9,6 +9,7 @@
 #include "performance_hint.h"
 #include "audio_cpu_placement.h"
 #include "patch_snapshot.h"
+#include "voice_catalog.h"
 #include "program_change_tracker.h"
 #include "callback_diagnostics.h"
 
@@ -163,6 +164,26 @@ std::string fromJava(JNIEnv* env, jstring text) {
     return result;
 }
 
+// JSON and immutable catalog construction run on UI/control workers only.
+// ROM names are validated printable ASCII by the catalog/snapshot helpers.
+std::string jsonString(const std::string& text) {
+    std::string result = "\"";
+    for (unsigned char c : text) {
+        if (c == '\\' || c == '"') { result += '\\'; result += char(c); }
+        else if (c < 0x20) {
+            char escaped[7];
+            std::snprintf(escaped, sizeof(escaped), "\\u%04x", unsigned(c));
+            result += escaped;
+        } else result += char(c);
+    }
+    return result + '"';
+}
+
+struct CatalogCache {
+    rimu::VoiceCatalog catalog;
+    std::string key, json;
+};
+
 enum class State { stopped, booting, playing, disconnected, failed };
 
 class Engine {
@@ -185,6 +206,9 @@ public:
             auto names = std::make_shared<const xg::voice_rom>(mu_->program_rom());
             patchLayoutKnown_ = names->ok();
             patches_.configure(patchLayoutKnown_);
+            romRevision_.fetch_add(1, std::memory_order_release);
+            std::atomic_store_explicit(&catalog_, std::shared_ptr<const CatalogCache>{},
+                                       std::memory_order_release);
             std::atomic_store_explicit(&voiceNames_, std::move(names), std::memory_order_release);
             if (!mu_->load_wave(romDir + "/dump"))
                 return fail("No se pudieron cargar las ondas: " + mu_->error());
@@ -298,12 +322,14 @@ public:
         state_.store(State::stopped, std::memory_order_release);
     }
 
-    void midi(const std::uint8_t* bytes, std::size_t size, int port) {
-        if (!running_.load(std::memory_order_acquire) || cancelled_.load()) return;
+    bool midi(const std::uint8_t* bytes, std::size_t size, int port) {
+        if (!running_.load(std::memory_order_acquire) || cancelled_.load()) return false;
         if (!midi_.enqueue(bytes, size, std::uint8_t(std::clamp(port, 0, 3)))) {
             dropped_.fetch_add(size, std::memory_order_relaxed);
             panic_.store(true, std::memory_order_release);
+            return false;
         }
+        return true;
     }
 
     void panic() { panic_.store(true, std::memory_order_release); }
@@ -324,24 +350,144 @@ public:
         if (enabled && !previous) diagnosticReset_.fetch_add(1, std::memory_order_release);
     }
 
-    std::array<std::string, 2> currentSound(int channel, bool followProgramChanges) {
+    std::string catalogKey(int mode, int set) const {
+        if (mode < 0 || set < 0 || !patches_.layout_known()) return {};
+        return "rom-" + std::to_string(romRevision_.load(std::memory_order_acquire))
+                + "-mode-" + std::to_string(mode) + "-set-" + std::to_string(set);
+    }
+
+    std::string voiceCatalog() {
+        // The Java lifecycle worker calls this once per ROM/mode/set change.
+        // It may wait for startup, but it never locks or blocks audio.
+        std::lock_guard<std::mutex> guard(control_);
+        const auto context = patches_.context();
+        const auto key = catalogKey(context[0], context[1]);
+        const auto cached = std::atomic_load_explicit(&catalog_, std::memory_order_acquire);
+        if (cached && cached->key == key) return cached->json;
+        const auto names = std::atomic_load_explicit(&voiceNames_, std::memory_order_acquire);
+        if (key.empty() || !names || !names->ok())
+            return "{\"key\":\"\",\"status\":\"Importá las ROMs e iniciá el motor para leer sus sonidos.\","
+                   "\"mode\":-1,\"voiceSet\":-1,\"recognized\":false,\"omittedSpecialBanks\":false,\"voices\":[]}";
+
+        auto cache = std::make_shared<CatalogCache>();
+        cache->key = key;
+        cache->catalog = rimu::buildVoiceCatalog(*names, context[0], context[1]);
+        const auto& catalog = cache->catalog;
+        const bool supported = catalog.recognized && (catalog.mode == 0 || catalog.mode == 1);
+        std::string status = supported ? "Voces de fábrica leídas de la ROM."
+                                       : "El catálogo no está disponible en este modo del firmware.";
+        if (supported && catalog.mode == 0)
+            status += " Sólo voces melódicas; los kits de este modo no están incluidos.";
+        else if (supported && catalog.omittedSpecialBanks)
+            status += " Los bancos especiales no están incluidos.";
+        std::string json = "{\"key\":" + jsonString(key) + ",\"status\":" + jsonString(status)
+                + ",\"mode\":" + std::to_string(catalog.mode)
+                + ",\"voiceSet\":" + std::to_string(catalog.voiceSet)
+                + ",\"recognized\":" + (supported ? "true" : "false")
+                + ",\"omittedSpecialBanks\":" + (catalog.omittedSpecialBanks ? "true" : "false")
+                + ",\"voices\":[";
+        bool first = true;
+        for (const auto& entry : catalog.entries) {
+            if (!first) json += ',';
+            first = false;
+            // A stable favorite uses a MIDI identity, never a filtered index,
+            // a display name, or the session-local cache revision.
+            const auto id = std::to_string(catalog.mode) + ':' + std::to_string(catalog.voiceSet)
+                    + ':' + std::to_string(entry.kind) + ':' + std::to_string(entry.msb)
+                    + ':' + std::to_string(entry.lsb) + ':' + std::to_string(entry.program);
+            json += "{\"id\":" + jsonString(id) + ",\"name\":" + jsonString(entry.name)
+                    + ",\"kind\":" + std::to_string(entry.kind)
+                    + ",\"family\":" + std::to_string(entry.family)
+                    + ",\"msb\":" + std::to_string(entry.msb)
+                    + ",\"lsb\":" + std::to_string(entry.lsb)
+                    + ",\"program\":" + std::to_string(entry.program) + '}';
+        }
+        cache->json = json + "]}";
+        std::shared_ptr<const CatalogCache> immutable = cache;
+        std::atomic_store_explicit(&catalog_, std::move(immutable), std::memory_order_release);
+        return cache->json;
+    }
+
+    std::string selectVoice(const std::string& key, int msb, int lsb, int program,
+                            int kind, int channel) {
+        if (!running()) return "Iniciá el audio para cargar un sonido.";
+        if (channel < 0 || channel > 15 || msb < 0 || msb > 127
+                || lsb < 0 || lsb > 127 || program < 0 || program > 127)
+            return "El banco, programa o canal solicitado no es válido.";
+        const auto context = patches_.context();
+        const auto cache = std::atomic_load_explicit(&catalog_, std::memory_order_acquire);
+        if (!cache || key.empty() || key != cache->key || key != catalogKey(context[0], context[1]))
+            return "El modo del firmware cambió. Esperá que se actualice el catálogo.";
+        const auto found = std::find_if(cache->catalog.entries.begin(), cache->catalog.entries.end(),
+                [&](const auto& entry) {
+                    return entry.msb == msb && entry.lsb == lsb && entry.program == program && entry.kind == kind;
+                });
+        if (found == cache->catalog.entries.end()) return "El sonido ya no está en el catálogo actual.";
+        const auto cc = std::uint8_t(0xb0 | channel);
+        const std::uint8_t message[8] = {cc, 0, std::uint8_t(msb), cc, 32, std::uint8_t(lsb),
+                                         std::uint8_t(0xc0 | channel), std::uint8_t(program)};
+        if (!midi(message, sizeof(message), 0)) return "No se pudo enviar el cambio de sonido.";
+        return {};
+    }
+
+    std::string stateJson(const rimu2000::PatchSnapshot::View& view, bool active,
+                           int route, int controlsRoute) const {
+        std::string result = "{\"running\":" + std::string(active ? "true" : "false")
+                + ",\"layoutKnown\":" + (patches_.layout_known() ? "true" : "false")
+                + ",\"mode\":" + std::to_string(view.mode)
+                + ",\"voiceSet\":" + std::to_string(view.voiceSet)
+                + ",\"catalogKey\":" + jsonString(catalogKey(view.mode, view.voiceSet))
+                + ",\"route\":" + std::to_string(route)
+                + ",\"controlRoute\":" + std::to_string(controlsRoute) + ",\"parts\":[";
+        bool first = true;
+        if (active) for (int part = 0; part < 64; ++part) {
+            const auto& data = view.parts[part];
+            if (!data.valid || data.receive_channel != controlsRoute) continue;
+            if (!first) result += ',';
+            first = false;
+            result += "{\"part\":" + std::to_string(part)
+                    + ",\"msb\":" + std::to_string(data.bank_msb)
+                    + ",\"lsb\":" + std::to_string(data.bank_lsb)
+                    + ",\"program\":" + std::to_string(data.program)
+                    + ",\"receive\":" + std::to_string(data.receive_channel)
+                    + ",\"partMode\":" + std::to_string(data.part_mode)
+                    + ",\"record\":" + std::to_string(data.voice_record)
+                    + ",\"kit\":" + std::to_string(data.kit);
+            const auto& controls = view.controls[part];
+            if (controls.valid) {
+                constexpr const char* names[] = {"cutoff", "resonance", "attack", "release", "reverb", "chorus"};
+                for (unsigned i = 0; i < controls.values.size(); ++i)
+                    result += ",\"" + std::string(names[i]) + "\":" + std::to_string(controls.values[i]);
+            }
+            result += '}';
+        }
+        return result + "]}";
+    }
+
+    std::array<std::string, 3> currentSound(int channel, bool followProgramChanges) {
         const int fallback = std::clamp(channel, 0, 15); // on-screen controls use port A
         observedChannel_.store(fallback, std::memory_order_relaxed);
         followPrograms_.store(followProgramChanges, std::memory_order_relaxed);
-        if (!running()) return {"Audio detenido", "Iniciá el motor para leer el sonido del firmware."};
-        const auto names = std::atomic_load_explicit(&voiceNames_, std::memory_order_acquire);
         const int pcRoute = lastProgramRoute_.load(std::memory_order_relaxed);
         const int route = followProgramChanges && pcRoute >= 0 ? pcRoute : fallback;
+        rimu2000::PatchSnapshot::View view;
+        const bool snapshotReady = patches_.read(view);
+        const bool active = running();
+        auto json = stateJson(view, active, route, fallback);
+        if (!active) return {"Audio detenido", "Iniciá el motor para leer el sonido del firmware.", std::move(json)};
+        const auto names = std::atomic_load_explicit(&voiceNames_, std::memory_order_acquire);
         std::string title, details = "Puerto ";
         details += char('A' + route / 16);
         details += " · canal " + std::to_string(route % 16 + 1);
         details += followProgramChanges && pcRoute >= 0
                 ? " · siguiendo Program Change" : " · canal de los controles";
         if (!names || !names->ok())
-            return {"Nombre no disponible", details + "\nFirmware sin mapa de nombres reconocido."};
+            return {"Nombre no disponible", details + "\nFirmware sin mapa de nombres reconocido.", std::move(json)};
+        if (!snapshotReady)
+            return {"Actualizando sonido…", details, std::move(json)};
         int matches = 0;
         for (int part = 0; part < 64; ++part) {
-            const auto data = patches_.load(part);
+            const auto& data = view.parts[part];
             if (!data.valid || data.receive_channel != route) continue;
             std::string name = rimu2000::resolve_patch_name(data, *names);
             if (name.empty()) name = "Nombre no disponible";
@@ -352,8 +498,8 @@ public:
                     + " · banco MSB " + std::to_string(data.bank_msb)
                     + " / LSB " + std::to_string(data.bank_lsb);
         }
-        if (!matches) return {"Sin parte receptora", details + "\nNinguna parte del firmware recibe en esa ruta."};
-        return {std::move(title), std::move(details)};
+        if (!matches) return {"Sin parte receptora", details + "\nNinguna parte del firmware recibe en esa ruta.", std::move(json)};
+        return {std::move(title), std::move(details), std::move(json)};
     }
 
     std::string callbackDiagnostics() const {
@@ -909,6 +1055,8 @@ private:
     rimu2000::CallbackDiagnostics callbackDiagnostics_;
     // Immutable ROM ownership is shared only by control/UI, never acquired in RT.
     std::shared_ptr<const xg::voice_rom> voiceNames_;
+    std::shared_ptr<const CatalogCache> catalog_;
+    std::atomic<std::uint64_t> romRevision_{0};
     bool patchLayoutKnown_ = false; // fixed before stream start
     std::uint64_t lastPatchTime_ = 0, previousCallbackBegin_ = 0, seenDiagnosticReset_ = 0;
     std::atomic<std::uint64_t> diagnosticReset_{0};
@@ -976,16 +1124,38 @@ Java_com_rinoize_rimu2000_NativeEngine_currentSound(JNIEnv* env, jclass, jint ch
     const auto sound = engine().currentSound(channel, follow == JNI_TRUE);
     jclass stringClass = env->FindClass("java/lang/String");
     if (!stringClass) return nullptr;
-    jobjectArray result = env->NewObjectArray(2, stringClass, nullptr);
+    jobjectArray result = env->NewObjectArray(3, stringClass, nullptr);
     env->DeleteLocalRef(stringClass);
     if (!result) return nullptr;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         jstring item = env->NewStringUTF(sound[i].c_str());
         if (!item) return result;
         env->SetObjectArrayElement(result, i, item);
         env->DeleteLocalRef(item);
     }
     return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_rimu2000_NativeEngine_voiceCatalog(JNIEnv* env, jclass) {
+    try {
+        const auto text = engine().voiceCatalog();
+        return env->NewStringUTF(text.c_str());
+    } catch (...) {
+        return env->NewStringUTF("{\"key\":\"\",\"recognized\":false,\"status\":\"No se pudo leer el catálogo.\",\"voices\":[]}");
+    }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_rinoize_rimu2000_NativeEngine_selectVoice(JNIEnv* env, jclass, jstring key,
+                                                  jint msb, jint lsb, jint program,
+                                                  jint kind, jint channel) {
+    try {
+        const auto result = engine().selectVoice(fromJava(env, key), msb, lsb, program, kind, channel);
+        return env->NewStringUTF(result.c_str());
+    } catch (...) {
+        return env->NewStringUTF("No se pudo cargar el sonido.");
+    }
 }
 
 extern "C" JNIEXPORT jstring JNICALL

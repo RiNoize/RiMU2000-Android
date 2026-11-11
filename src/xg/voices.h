@@ -145,18 +145,23 @@ public:
 		return byte(tab + u32(lsb)) != byte(tab);
 	}
 
-	u32 lookup(int mode, int set, int msb, int lsb, int prog) const
+	// The group selects the complete 128-program table. Exposing it lets a
+	// browser enumerate equivalent banks once, without probing one program and
+	// assuming all the others match. -1 denotes an unavailable/special path.
+	// This deliberately does not apply lsb_ok(): lookup's existing callers may
+	// inspect a mapping even when firmware would ignore that bank-select LSB.
+	int bank_group(int mode, int set, int msb, int lsb) const
 	{
 		if (!m_ok)
-			return 0;
-		msb &= 0x7f; lsb &= 0x7f; prog &= 0x7f;
+			return -1;
+		msb &= 0x7f; lsb &= 0x7f;
 		u32 group = 76;
 		if (mode == 0) {
 			const u8 g = byte(GROUP_GM + msb);
 			group = g == 0xff ? 76 : g;
 		} else if (mode == 1) {
 			if (msb == 16 && lsb < 2)
-				return 0;                        // firmware は別の関数へ行く。まだ真似していない
+				return -1;                       // firmware は別の関数へ行く。まだ真似していない
 			const u8 kind = byte(GROUP_XG + msb);
 			if (kind == 0)
 				group = byte((set == 0 ? GROUP_LSB0 : GROUP_LSB1) + lsb);
@@ -167,7 +172,16 @@ public:
 			else
 				group = kind;
 		}
-		const u32 slot = VOICE_TABLE + group * 512 + u32(prog) * 4;
+		return int(group);
+	}
+
+	u32 lookup(int mode, int set, int msb, int lsb, int prog) const
+	{
+		const int group = bank_group(mode, set, msb, lsb);
+		if (group < 0)
+			return 0;
+		prog &= 0x7f;
+		const u32 slot = VOICE_TABLE + u32(group) * 512 + u32(prog) * 4;
 		if (slot + 4 > m_rom->size())
 			return 0;
 		const u32 off = u32(byte(slot)) << 24 | u32(byte(slot + 1)) << 16 | u32(byte(slot + 2)) << 8 | byte(slot + 3);

@@ -22,12 +22,26 @@ struct PartPatchData {
     bool valid = false;
 };
 
+// Values are the firmware's current MIDI-scale parameters, not UI defaults.
+// Offsets follow xg/model.cpp: brightness, resonance, attack, release and sends.
+struct PartControlData {
+    enum Index { cutoff, resonance, attack, release, reverb, chorus, count };
+    std::array<std::uint8_t, count> values{};
+    bool valid = false;
+};
+
 class PatchSnapshot {
 public:
     static constexpr int part_count = 64;
     static constexpr std::uint32_t first_voice_record = 0x200ee0;
     static constexpr std::uint32_t last_voice_record = 0x23cece - 16;
     static constexpr std::uint32_t kit_offset = 0x110;
+
+    struct View {
+        std::array<PartPatchData, part_count> parts{};
+        std::array<PartControlData, part_count> controls{};
+        int mode = -1, voiceSet = -1;
+    };
 
     // Called before the emulation owner starts, with voice_rom::ok() evaluated
     // outside the audio callback. Changing ROMs also discards the old metadata.
@@ -38,7 +52,11 @@ public:
     }
 
     void clear() noexcept {
+        serial_.fetch_add(1, std::memory_order_acq_rel);
         for (auto& word : parts_) word.store(0, std::memory_order_release);
+        for (auto& word : controls_) word.store(0, std::memory_order_release);
+        context_.store(0, std::memory_order_release);
+        serial_.fetch_add(1, std::memory_order_release);
     }
 
     bool layout_known() const noexcept {
@@ -74,6 +92,41 @@ public:
             | (std::uint32_t(block[offset + 2]) << 8) | block[offset + 3];
         data.voice_record = valid_record(record) ? record : 0;
         data.valid = valid_fields(data);
+        return data;
+    }
+
+    static PartControlData captureControls(const std::vector<std::uint8_t>& ram,
+                                           int part, bool layout_known) noexcept {
+        PartControlData result;
+        if (!layout_known || part < 0 || part >= part_count) return result;
+        const std::size_t base = xg::ram::part_base(part);
+        constexpr std::array<unsigned, PartControlData::count> offsets{
+            0x18, 0x19, 0x1a, 0x1c, 0x13, 0x12};
+        if (base >= ram.size() || ram.size() - base <= 0x1c) return result;
+        for (unsigned i = 0; i < offsets.size(); ++i) {
+            result.values[i] = ram[base + offsets[i]];
+            if (result.values[i] > 127) return result;
+        }
+        result.valid = true;
+        return result;
+    }
+
+    static std::uint64_t packControls(const PartControlData& data) noexcept {
+        if (!data.valid) return 0;
+        std::uint64_t word = std::uint64_t(1) << 42;
+        for (unsigned i = 0; i < data.values.size(); ++i) {
+            if (data.values[i] > 127) return 0;
+            word |= std::uint64_t(data.values[i]) << (i * 7);
+        }
+        return word;
+    }
+
+    static PartControlData unpackControls(std::uint64_t word) noexcept {
+        PartControlData data;
+        if (!(word & (std::uint64_t(1) << 42)) || word >> 43) return data;
+        for (unsigned i = 0; i < data.values.size(); ++i)
+            data.values[i] = std::uint8_t((word >> (i * 7)) & 127);
+        data.valid = true;
         return data;
     }
 
@@ -117,14 +170,52 @@ public:
             clear();
             return false;
         }
-        for (int part = 0; part < part_count; ++part)
+        serial_.fetch_add(1, std::memory_order_acq_rel);
+        for (int part = 0; part < part_count; ++part) {
             parts_[part].store(pack(capturePart(ram, part, true)), std::memory_order_release);
+            controls_[part].store(packControls(captureControls(ram, part, true)),
+                                  std::memory_order_release);
+        }
+        context_.store(0x10000u | std::uint32_t(ram[xg::ram::VOICE_MODE])
+                       | (std::uint32_t(ram[xg::ram::VOICE_SET]) << 8),
+                       std::memory_order_release);
+        serial_.fetch_add(1, std::memory_order_release);
         return true;
     }
 
     PartPatchData load(int part) const noexcept {
         if (part < 0 || part >= part_count) return {};
         return unpack(parts_[part].load(std::memory_order_acquire), part);
+    }
+
+    // A bounded, coherent read keeps controls and catalog context aligned with
+    // the patch update. All payload words are atomic, including on a retry.
+    // Audio never waits for readers and never allocates while publishing.
+    bool read(View& view) const noexcept {
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            const auto before = serial_.load(std::memory_order_acquire);
+            if (before & 1) continue;
+            const auto context = context_.load(std::memory_order_acquire);
+            for (int part = 0; part < part_count; ++part) {
+                view.parts[part] = unpack(parts_[part].load(std::memory_order_acquire), part);
+                view.controls[part] = unpackControls(controls_[part].load(std::memory_order_acquire));
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (before == serial_.load(std::memory_order_relaxed)) {
+                view.mode = context & 0x10000u ? int(context & 255u) : -1;
+                view.voiceSet = context & 0x10000u ? int((context >> 8) & 255u) : -1;
+                return (context & 0x10000u) != 0;
+            }
+        }
+        view = View{};
+        return false;
+    }
+
+    // Mode and set are one atomic pair, usable as a cache key outside audio.
+    std::array<int, 2> context() const noexcept {
+        const auto word = context_.load(std::memory_order_acquire);
+        if (!(word & 0x10000u)) return {-1, -1};
+        return {int(word & 255u), int((word >> 8) & 255u)};
     }
 
     static constexpr bool valid_fields(const PartPatchData& data) noexcept {
@@ -138,7 +229,10 @@ private:
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
                   "Patch snapshots require lock-free 64-bit atomics");
     std::atomic<bool> layout_known_{false};
+    std::atomic<std::uint64_t> serial_{0};
+    std::atomic<std::uint32_t> context_{0};
     std::array<std::atomic<std::uint64_t>, part_count> parts_{};
+    std::array<std::atomic<std::uint64_t>, part_count> controls_{};
 };
 
 // Match the upstream desktop's shown_bank_msb(): GS drums can retain MSB 0

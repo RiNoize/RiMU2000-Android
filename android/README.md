@@ -1,10 +1,30 @@
-# RiMU2000 para Android — 0.1.3 alpha
+# RiMU2000 para Android — 0.1.4 alpha
 
 Primera aplicación independiente para Android del motor de [S-MU2000](https://github.com/tarboh/S-MU2000). Ejecuta el firmware del MU2000 y conserva la emulación del SH7043 y de los dos SWP30, incluidos los compiladores JIT ARM64 de upstream. La interfaz Android conecta ese motor con MIDI y audio del dispositivo.
 
 La alpha está orientada a la Samsung Galaxy Tab A9 y requiere Android 8.0 o superior con CPU ARM64. El rendimiento y la latencia deben medirse en la tablet: que el código compile no garantiza ausencia de cortes con todas las canciones o sonidos.
 
-## Cambios de 0.1.3
+## Cambios de 0.1.4
+
+Esta versión reorganiza la pantalla para elegir y tocar sonidos desde la tablet. Conserva el motor, la síntesis del firmware y los ajustes de audio de 0.1.3.
+
+- **Explorador de sonidos.** La lista usa los nombres y mapas reconocidos de la ROM importada y del modo actual del firmware. Permite buscar por nombre, banco o programa, filtrar por familia y banco, y guardar favoritos locales. Buscar, filtrar y marcar una estrella no envía MIDI. Tocar una fila solicita ese sonido para el destino que indica la pantalla.
+- **Destino explícito.** El teclado, la selección de sonido y los seis mandos se dirigen al **puerto A y al canal MIDI elegido**. Una parte del MU2000 puede recibir en otro canal o compartirlo con otras partes: estos controles afectan a todas las partes que escuchan esa ruta. El resto de los canales sigue disponible para la interpretación multitímbrica desde MIDI externo. El seguimiento del último Program Change actualiza el nombre mostrado, sin mover el destino de los controles.
+- **Confirmación del firmware.** Una selección queda pendiente hasta que un snapshot posterior refleja banco y programa. El nombre actual procede de la voz que realmente seleccionó el firmware; no se sustituye por el nombre solicitado del catálogo. El programa se presenta como 1–128 y se envía como 0–127. Un cambio de modo o de ROM invalida el catálogo anterior.
+- **Mandos de sonido.** Cutoff, resonancia, attack y release envían CC74, CC71, CC73 y CC72. Son desplazamientos relativos a la voz, con centro MIDI 64, no valores físicos de frecuencia o duración. Reverb y chorus envían CC91 y CC93 y representan el envío de cada parte al efecto. Todos usan valores MIDI 0–127 leídos de RAM: no se envían valores iniciales al abrir la pantalla, cambiar de canal o refrescar. Los controles sólo envían al recibir un gesto del usuario. Si varias partes comparten ruta y sus valores difieren, la interfaz indica el estado mixto.
+- **Conexiones y diagnóstico.** El menú **⋮** abre los ajustes de ROMs, audio y MIDI, las medidas técnicas, la selección manual de banco/programa y las licencias. El botón **Teclas** muestra u oculta el teclado en pantalla, inicialmente oculto. Se conservan el detalle de cortes y la copia de diagnóstico.
+
+El catálogo no pretende cubrir rutas que upstream todavía no identifica. Omite el banco especial XG MSB 16/LSB 0–1; en modo 0 muestra únicamente las voces melódicas reconocidas y no deduce sus baterías a partir de las tablas XG. El modo 0 se presenta como GM y señala su alcance melódico. Si el mapa de la ROM no se reconoce, no inventa un catálogo GM. Las categorías agrupan los programas para facilitar la búsqueda; el nombre de cada entrada procede del mapa de voces reconocido.
+
+En la comprobación con firmware EX 2.01, modo XG y set 1, el catálogo contiene **1.426 entradas seleccionables**: 1.386 melódicas, 32 direcciones de kits de batería y 8 de kits SFX. No significa 1.426 timbres distintos: la deduplicación melódica conserva programa y registro, y los kits conservan sus direcciones alternativas. En modo 0 se obtuvieron 472 entradas melódicas y se omitieron los kits. La cantidad depende del mapa, el modo y el set del firmware.
+
+Los valores de los mandos pueden cambiar después de seleccionar una voz, porque el firmware repone algunos ajustes propios del sonido. Por eso reverb 40, chorus 0 y el centro 64 son referencias iniciales, no una afirmación sobre el sonido que está activo. La aplicación vuelve a leer el estado efectivo.
+
+### Revisión visual y límites
+
+La revisión de composición usa las vistas Android de la aplicación con [Robolectric Native Graphics](https://developer.android.com/training/testing/ui-tests/screenshot) y datos sintéticos identificados como QA, sin cargar ROMs ni ejecutar audio. El harness vive fuera del proyecto distribuido y sus dependencias no se añaden al APK. Estas capturas ayudan a revisar tamaños, orientación y texto grande; no verifican AAudio, MIDI físico, rendimiento ni el comportamiento exacto de las barras del sistema de la tablet.
+
+## Cambios anteriores: 0.1.3
 
 Esta actualización responde a dos resultados distintos en la A9: con 1024 frames aparecen xruns incluso con sonidos sencillos; con 2048 la reproducción suele ser estable y los cortes aparecen en algunos pads con sustain. La captura de 0.1.2 con afinidad aplicada mostró render reciente del 54,3 %, frente al 127,8 % anterior, pero esas capturas no son un ensayo controlado de todos los sonidos.
 
@@ -105,10 +125,11 @@ Los archivos se copian al almacenamiento privado de la aplicación. Si no se imp
 
 ## Primer ensayo en la tablet
 
-1. Instala el APK ARM64 e importa las ROMs.
-2. Conecta el controlador USB-MIDI, selecciónalo en la aplicación y elige la salida de auriculares o altavoz de la tablet.
+1. Instala el APK ARM64 y abre **⋮ → Conexiones** para importar las ROMs.
+2. Conecta el controlador USB-MIDI, selecciónalo en Conexiones y elige la salida de auriculares o altavoz de la tablet.
 3. Empieza con un buffer de **2048 frames**, inicia el audio y prueba unas notas. Si funciona estable, prueba 1024 y después 512.
-4. Anota el render, los callbacks fuera de presupuesto y los xruns. Son medidas distintas; el porcentaje de render no equivale a la latencia entre tecla y sonido.
+4. Elige el canal de los controles, busca un sonido y toca su fila para solicitarlo. El LCD puede estar siguiendo un Program Change externo de otro canal; el destino del buscador y los mandos sigue indicado por separado. Para tocar sin controlador, abre **Teclas**.
+5. En **⋮ → Diagnóstico**, anota el render, los callbacks fuera de presupuesto y los xruns. Son medidas distintas; el porcentaje de render no equivale a la latencia entre tecla y sonido.
 
 El tamaño elegido solicita el buffer utilizable. Android elige el tamaño del callback por separado; el diagnóstico muestra ambos valores efectivos. A 48 kHz, 1024 frames representan 21,33 ms de audio y 2048 representan 42,67 ms; esos valores no son una medición de la latencia total entre tecla y sonido.
 
@@ -141,7 +162,7 @@ No se incluye una clave privada en el repositorio. Una compilación realizada en
 
 ## GitHub Actions
 
-El workflow **Android alpha** compila cuando se actualiza la rama `android` y permite una ejecución manual. Antes del APK ejecuta la verificación del motor de upstream sin ROMs, las pruebas de MIDI, cola concurrente, selector de CPU, conversor sinc, nombres de partes y registro de callbacks; también ejecuta Android Lint. En **Actions → Android alpha → ejecución terminada → Artifacts**, descarga `RiMU2000-0.1.3-arm64`, que contiene el APK y el código fuente de ese commit.
+El workflow **Android alpha** compila cuando se actualiza la rama `android` y permite una ejecución manual. Antes del APK ejecuta la verificación del motor de upstream sin ROMs, las pruebas de MIDI, cola concurrente, selector de CPU, conversor sinc, nombres de partes, catálogo de voces y registro de callbacks; también ejecuta Android Lint. En **Actions → Android alpha → ejecución terminada → Artifacts**, descarga `RiMU2000-0.1.4-arm64`, que contiene el APK y el código fuente de ese commit.
 
 La compilación de CI no necesita ROMs y no verifica sonido. Las pruebas con firmware y mediciones de rendimiento se realizan por separado en un dispositivo.
 

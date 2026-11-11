@@ -9,6 +9,7 @@
 #include <thread>
 
 using rimu2000::PartPatchData;
+using rimu2000::PartControlData;
 using rimu2000::PatchSnapshot;
 
 namespace {
@@ -37,6 +38,22 @@ void put_part(std::vector<std::uint8_t>& ram, const PartPatchData& data) {
     block[PatchSnapshot::kit_offset] = data.kit;
     for (unsigned i = 0; i < 4; ++i)
         block[xg::voice_rom::PART_VOICE + i] = std::uint8_t(data.voice_record >> (24 - 8 * i));
+}
+
+PartControlData controls_for(int part, bool alternate = false) {
+    PartControlData data;
+    data.valid = true;
+    for (unsigned i = 0; i < data.values.size(); ++i) {
+        const auto value = std::uint8_t(part + int(i) * 8);
+        data.values[i] = alternate ? std::uint8_t(127 - value) : value;
+    }
+    return data;
+}
+
+void put_controls(std::vector<std::uint8_t>& ram, int part, const PartControlData& data) {
+    constexpr std::array<unsigned, PartControlData::count> offsets{0x18, 0x19, 0x1a, 0x1c, 0x13, 0x12};
+    for (unsigned i = 0; i < offsets.size(); ++i)
+        ram[xg::ram::part_base(part) + offsets[i]] = data.values[i];
 }
 
 PartPatchData example(int part, int variant = 0) {
@@ -89,12 +106,16 @@ int main() {
     require(xg::ram::part_base(63) == xg::ram::PARTS + 63 * xg::ram::PART_STRIDE, "D16 last slot");
 
     std::vector<std::uint8_t> ram(0x40000, 0), alternate(0x40000, 0);
+    ram[xg::ram::VOICE_MODE] = 1;
+    ram[xg::ram::VOICE_SET] = 1;
     std::array<PartPatchData, 64> expected{}, other{};
     for (int part = 0; part < 64; ++part) {
         expected[part] = example(part);
         other[part] = example(part, 1);
         put_part(ram, expected[part]);
         put_part(alternate, other[part]);
+        put_controls(ram, part, controls_for(part));
+        put_controls(alternate, part, controls_for(part, true));
     }
     // Two parts can listen to the same route; neither overwrites the other.
     expected[5].receive_channel = expected[0].receive_channel;
@@ -104,10 +125,19 @@ int main() {
     snapshot.configure(true);
     require(snapshot.layout_known() && !snapshot.load(0).valid, "configure discards old state");
     require(snapshot.publish(ram), "publish full RAM");
+    PatchSnapshot::View view;
+    require(snapshot.read(view) && view.mode == 1 && view.voiceSet == 1,
+            "mode and voice set come from owner snapshot");
+    require(snapshot.context() == std::array<int, 2>{1, 1}, "context cache key is one atomic pair");
     for (int part = 0; part < 64; ++part) {
         require(same(snapshot.load(part), expected[part]), "bank/program/record/route capture");
         require(same(PatchSnapshot::capturePart(ram, part, true), expected[part]), "pure owner capture");
         require(same(PatchSnapshot::unpack(PatchSnapshot::pack(expected[part]), part), expected[part]), "atomic word roundtrip");
+        const auto wanted = controls_for(part);
+        require(view.controls[part].valid && view.controls[part].values == wanted.values,
+                "all six current controls use their real RAM offsets");
+        const auto decoded = PatchSnapshot::unpackControls(PatchSnapshot::packControls(wanted));
+        require(decoded.valid && decoded.values == wanted.values, "control word roundtrip");
     }
     require(snapshot.load(0).receive_channel == snapshot.load(5).receive_channel,
             "shared receive route retains both parts");
@@ -117,6 +147,8 @@ int main() {
         && !PatchSnapshot::capturePart(ram, 0, false).valid, "capture guards");
     const std::vector<std::uint8_t> short_ram(xg::ram::part_base(63) + PatchSnapshot::kit_offset, 0);
     require(!snapshot.publish(short_ram), "truncated RAM rejected");
+    require(!snapshot.read(view) && snapshot.context() == std::array<int, 2>{-1, -1},
+            "truncated RAM clears catalog context and controls");
     require(!snapshot.load(0).valid && !snapshot.load(63).valid, "truncated RAM clears stale patches");
     require(!PatchSnapshot::capturePart(short_ram, 63, true).valid, "kit byte bounds checked");
 
@@ -149,6 +181,19 @@ int main() {
     }
     require(!PatchSnapshot::unpack(PatchSnapshot::pack(example(0)) | (std::uint64_t(1) << 63)).valid,
             "reserved bits rejected");
+    auto invalidControls = controls_for(0);
+    invalidControls.values[PartControlData::release] = 255;
+    require(PatchSnapshot::packControls(invalidControls) == 0, "invalid control cannot wrap to a MIDI value");
+    put_controls(ram, 0, invalidControls);
+    require(!PatchSnapshot::captureControls(ram, 0, true).valid, "invalid RAM control is unavailable");
+    put_controls(ram, 0, controls_for(0));
+    require(!PatchSnapshot::captureControls(ram, -1, true).valid
+        && !PatchSnapshot::captureControls(ram, 64, true).valid
+        && !PatchSnapshot::captureControls(ram, 0, false).valid
+        && !PatchSnapshot::captureControls(std::vector<std::uint8_t>{}, 0, true).valid,
+        "control capture validates indices, layout and size");
+    require(!PatchSnapshot::unpackControls(std::uint64_t(1) << 43).valid,
+            "reserved control bits rejected");
 
     const auto bytes = synthetic_rom();
     const xg::voice_rom rom(bytes);
@@ -202,9 +247,22 @@ int main() {
         const int part = int(reads++ & 63);
         const auto data = snapshot.load(part);
         require(same(data, expected[part]) || same(data, other[part]), "concurrent reader sees one complete part tuple");
+        if ((reads & 63) == 0 && snapshot.read(view)) {
+            require(view.mode == view.voiceSet && (view.mode == 0 || view.mode == 1),
+                    "coherent snapshot includes matching mode and set");
+            const bool alternateView = view.mode == 0;
+            for (int p = 0; p < 64; ++p) {
+                require(same(view.parts[p], alternateView ? other[p] : expected[p]),
+                        "whole view never mixes parts from distinct updates");
+                require(view.controls[p].valid
+                            && view.controls[p].values == controls_for(p, alternateView).values,
+                        "control values belong to the same patch and context update");
+            }
+        }
     }
     writer.join();
     snapshot.configure(false);
     require(!snapshot.layout_known() && !snapshot.load(0).valid && !snapshot.publish(ram), "stop/ROM change clears snapshot");
-    std::printf("Patch snapshot: ordering, routes, bounds, firmware names and concurrent tuples passed (%zu checks).\n", checks);
+    require(!snapshot.read(view), "unknown ROM cannot publish current controls");
+    std::printf("Patch snapshot: routes, bounds, firmware names, current controls and coherent concurrent views passed (%zu checks).\n", checks);
 }
