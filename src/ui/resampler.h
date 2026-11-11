@@ -25,8 +25,10 @@
 #include "compat/mamecompat.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <vector>
 
 namespace ui {
@@ -47,12 +49,55 @@ public:
 		// 上へ変換するときは入力のナイキストまで通す。
 		// 下へ変換するときは出力のナイキストで切らないと折り返す
 		m_cutoff = std::min(1.0, out_rate / in_rate) * 0.955;
+		m_phases.clear();
 		if (quality == resampler_quality::sinc && m_tab.empty())
 			build_table();
 		reset();
 	}
 
 	bool direct() const { return m_direct; }
+
+	// Android opts in when both sample rates are integers. The same 64-tap
+	// kernel repeats after out_rate / gcd(in_rate, out_rate) output frames;
+	// prepare it once, outside the audio callback. Existing configure() users
+	// keep the original floating-position implementation and quality options.
+	void configure_precomputed_sinc(int in_rate, int out_rate)
+	{
+		if (in_rate <= 0) in_rate = 44100;
+		if (out_rate <= 0) out_rate = in_rate;
+		configure(in_rate, out_rate, resampler_quality::sinc);
+		if (m_direct)
+			return;
+		const int divisor = std::gcd(in_rate, out_rate);
+		const int phases = out_rate / divisor;
+		// Bound setup cost and memory for unusual device rates. The generic
+		// sinc remains available when the rational cycle is too large.
+		if (phases > MAX_PHASES)
+			return;
+		m_phase_numerator = in_rate / divisor;
+		m_phase_whole = m_phase_numerator / phases;
+		m_phase_fraction = m_phase_numerator % phases;
+		m_phases.resize(phases);
+		for (int p = 0; p < phases; ++p) {
+			auto &kernel = m_phases[p];
+			const double fraction = double(p) / double(phases);
+			for (int tap = 0; tap < TAPS; ++tap) {
+				const int k = tap - HALF + 1;
+				const double fx = std::fabs((fraction - double(k)) * m_cutoff) * STEPS;
+				const size_t j = size_t(fx);
+				if (j + 1 >= m_tab.size())
+					continue;
+				const double t = fx - double(j);
+				// Preserve the original float-table subtraction before the
+				// double interpolation, and normalize after convolution.
+				const double h = m_tab[j] + (m_tab[j + 1] - m_tab[j]) * t;
+				kernel.weights[tap] = h;
+				kernel.sum += h;
+			}
+		}
+	}
+
+	int phase_count() const { return int(m_phases.size()); }
 
 	// 中身を捨てる（再生位置が飛んだ、止まった等）
 	void reset()
@@ -61,6 +106,8 @@ public:
 		std::memset(m_ring_r, 0, sizeof(m_ring_r));
 		m_written = 0;
 		m_pos     = 0.0;
+		m_phase_centre = 0;
+		m_phase = 0;
 	}
 
 	// out フレーム出すのに、あと何フレーム入力が要るか
@@ -70,6 +117,11 @@ public:
 			return out_frames;
 		if (out_frames <= 0)
 			return 0;
+		if (!m_phases.empty()) {
+			const s64 last = m_phase_centre + (s64(m_phase)
+					+ s64(out_frames - 1) * m_phase_numerator) / s64(m_phases.size());
+			return int(std::max<s64>(0, last + HALF + 1 - m_written));
+		}
 		// 最後の 1 フレームの畳み込みに要る、いちばん先のサンプル
 		const double last = m_pos + m_step * double(out_frames - 1);
 		const s64 need = s64(std::floor(last)) + lookahead() + 1;
@@ -81,6 +133,13 @@ public:
 	{
 		if (m_direct)
 			return int(std::max<s64>(0, m_written - s64(m_pos)));
+		if (!m_phases.empty()) {
+			const s64 room = m_written - HALF - m_phase_centre;
+			if (room <= 0)
+				return 0;
+			const s64 available = room * s64(m_phases.size()) - 1 - m_phase;
+			return int(available / m_phase_numerator + 1);
+		}
 		const double room = double(m_written - lookahead() - 1) - m_pos;
 		if (room < 0.0)
 			return 0;
@@ -116,6 +175,7 @@ private:
 	static constexpr int TAPS = 64;
 	static constexpr int HALF = TAPS / 2;
 	static constexpr int STEPS = 256;             // 1 サンプル間隔あたりの表の刻み
+	static constexpr int MAX_PHASES = 2048;
 	// 1 回に頼まれる量（30ms ぶん = 1440 フレーム）より十分大きく取る。
 	// 足りないと、畳み込みにまだ要るサンプルを上書きしてしまう
 	static constexpr int RING = 4096, RMASK = RING - 1;
@@ -137,8 +197,54 @@ private:
 
 	int lookahead() const { return m_quality == resampler_quality::sinc ? HALF : 1; }
 
+	void one_precomputed(float &l, float &r)
+	{
+		const auto &kernel = m_phases[m_phase];
+		double al = 0.0, ar = 0.0, sum = kernel.sum;
+		const s64 first = m_phase_centre - HALF + 1;
+		if (first >= 0 && m_phase_centre + HALF < m_written) {
+			// Steady state: only a stereo convolution, with no coefficient
+			// interpolation or input-bound checks inside the tap loop.
+			for (int tap = 0; tap < TAPS; ++tap) {
+				const int index = int((first + tap) & RMASK);
+				const double h = kernel.weights[tap];
+				al += h * m_ring_l[index];
+				ar += h * m_ring_r[index];
+			}
+		} else {
+			// At startup the upstream filter omits negative input indices
+			// and normalizes only the remaining coefficients.
+			sum = 0.0;
+			for (int tap = 0; tap < TAPS; ++tap) {
+				const s64 index = first + tap;
+				if (index < 0 || index >= m_written)
+					continue;
+				const double h = kernel.weights[tap];
+				al += h * m_ring_l[index & RMASK];
+				ar += h * m_ring_r[index & RMASK];
+				sum += h;
+			}
+		}
+		if (sum > 1e-9) {
+			al /= sum;
+			ar /= sum;
+		}
+		l = float(std::clamp(al, -1.0, 1.0));
+		r = float(std::clamp(ar, -1.0, 1.0));
+		m_phase_centre += m_phase_whole;
+		m_phase += m_phase_fraction;
+		if (m_phase >= int(m_phases.size())) {
+			m_phase -= int(m_phases.size());
+			++m_phase_centre;
+		}
+	}
+
 	void one(float &l, float &r)
 	{
+		if (!m_phases.empty()) {
+			one_precomputed(l, r);
+			return;
+		}
 		const s64 centre = s64(std::floor(m_pos));
 		if (m_direct) {
 			const s64 idx = centre;
@@ -185,6 +291,13 @@ private:
 	}
 
 	std::vector<float> m_tab;
+	struct phase_kernel {
+		std::array<double, TAPS> weights{};
+		double sum = 0.0;
+	};
+	std::vector<phase_kernel> m_phases;
+	s64 m_phase_centre = 0;
+	int m_phase = 0, m_phase_numerator = 1, m_phase_whole = 1, m_phase_fraction = 0;
 	float   m_ring_l[RING] = {};
 	float   m_ring_r[RING] = {};
 	s64     m_written = 0;

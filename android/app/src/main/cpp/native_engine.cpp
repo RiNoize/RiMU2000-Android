@@ -7,6 +7,7 @@
 #include "ui/resampler.h"
 #include "midi_queue.h"
 #include "performance_hint.h"
+#include "audio_cpu_placement.h"
 
 #include <algorithm>
 #include <array>
@@ -41,7 +42,8 @@ std::uint64_t elapsedSince(std::uint64_t begin, std::uint64_t end) {
 }
 
 const char* schedulerName(int policy) {
-    switch (policy) {
+    if (policy < 0) return "no disponible";
+    switch (policy & ~SCHED_RESET_ON_FORK) {
     case SCHED_OTHER: return "NORMAL";
     case SCHED_FIFO: return "FIFO";
     case SCHED_RR: return "RR";
@@ -156,13 +158,14 @@ enum class State { stopped, booting, playing, disconnected, failed };
 class Engine {
 public:
     std::string start(const std::string& romDir, const std::string& stateDir,
-                      int frames, int deviceId) {
+                      int frames, int deviceId, int cpuMode) {
         std::lock_guard<std::mutex> guard(control_);
         stopLocked();
         cancelled_.store(false, std::memory_order_release);
         state_.store(State::booting, std::memory_order_release);
         resetStatistics();
         try {
+            cpuPlacement_.prepare(cpuMode);
             frames = (frames == 512 || frames == 1024 || frames == 2048) ? frames : 1024;
             requestedFrames_.store(frames);
             stateDir_ = stateDir;
@@ -250,7 +253,8 @@ public:
             result = AAudioStream_setBufferSizeInFrames(stream_, std::min(capacity, wanted));
             if (result < 0) return fail(audioError("Ajustar buffer", result));
             actualBuffer_.store(AAudioStream_getBufferSizeInFrames(stream_));
-            resampler_.configure(kEngineRate, rate, ui::resampler_quality::sinc);
+            resampler_.configure_precomputed_sinc(kEngineRate, rate);
+            resamplerPhases_.store(resampler_.phase_count());
             midi_.reset();
             panic_.store(false);
             midi_.setEnabled(true);
@@ -375,9 +379,9 @@ public:
             "Bloque %.2f ms reloj / %.2f ms CPU / %.2f ms disponibles · motor %.1f%% + conversión %.1f%%\n"
             "Total render %.1f%% (máx %.1f%%) · CPU hilo %.1f%% / app %.1f%% (100%% = 1 núcleo)\n"
             "Xruns %d · tarde reciente %llu/%llu · total %llu/%llu\n"
-            "44100 → %d Hz · callback %d fr (pedido %d) · buffer real %d fr · ráfaga %d\n"
+            "44100 → %d Hz · callback %d fr (pedido %d) · buffer real %d fr · ráfaga %d · sinc64 fases %d\n"
             "MIDI %llu bytes · descartados %llu · pendientes %llu · salida ID %d\n"
-            "Hilo %d · CPU #%d · vistas %s · %s prioridad %d · AAudio %s/%s\n"
+            "Hilo %d · CPU #%d · vistas %s · %s%s prioridad %d · AAudio %s/%s\n"
             "ADPF %s · informes %llu · omitidos %llu · error %d\n"
             "%s\nARM64 · firmware original · 1 hilo de render%s",
             label, hasRecent ? "Reciente" : "Inicial", double(recent.span) / 1000000000.0,
@@ -388,17 +392,20 @@ public:
             static_cast<unsigned long long>(recent.late), static_cast<unsigned long long>(recent.callbacks),
             static_cast<unsigned long long>(late_.load()),
             static_cast<unsigned long long>(callbacks_.load()), rate, observedFrames_.load(), requestedFrames_.load(),
-            actualBuffer_.load(), burst_.load(),
+            actualBuffer_.load(), burst_.load(), resamplerPhases_.load(),
             static_cast<unsigned long long>(midiReceived_.load()),
             static_cast<unsigned long long>(dropped_.load() + internalDropped_.load()),
             static_cast<unsigned long long>(pendingMidi_.load()), device_.load(),
             audioTid_.load(), lastCpu_.load(), cpus.c_str(), schedulerName(policy_.load()),
+            policy_.load() >= 0 && (policy_.load() & SCHED_RESET_ON_FORK) ? "+reset-fork" : "",
             priority_.load(), performance, sharing,
             performanceHint_.statusText(), static_cast<unsigned long long>(performanceHint_.reports()),
             static_cast<unsigned long long>(performanceHint_.dropped()), performanceHint_.error(),
             jitText.c_str(),
             nvramWarning_.load() ? "\nNo se pudieron guardar los ajustes de la sesión." : "");
-        return out;
+        // Concatenate after formatting so even a large, sparse CPU mask is not
+        // silently cut to the fixed buffer used for the other diagnostics.
+        return std::string(out) + "\n" + cpuPlacement_.describe();
     }
 
 private:
@@ -472,6 +479,7 @@ private:
         maxPercent_.store(0); xruns_.store(0); dropped_.store(0); midiReceived_.store(0);
         internalDropped_.store(0); pendingMidi_.store(0); observedFrames_.store(0);
         rate_.store(0); actualBuffer_.store(0); burst_.store(0); device_.store(0);
+        resamplerPhases_.store(0);
         startTime_.store(0); startCpu_.store(0); nvramWarning_.store(false);
         audioCpuNs_.store(0); coreNs_.store(0); conversionNs_.store(0); cpuMask_.store(0);
         audioTid_.store(0); lastCpu_.store(-1); policy_.store(-1); priority_.store(0);
@@ -549,10 +557,12 @@ private:
         if (count <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
         if (!running_.load(std::memory_order_acquire) || cancelled_.load(std::memory_order_acquire)) {
             std::fill_n(output, std::size_t(count) * 2, 0.0f);
+            cpuPlacement_.restoreCurrentThread();
             return AAUDIO_CALLBACK_RESULT_STOP;
         }
         if (!jitBaseline_) beginJitWindow();
         const int tid = gettid();
+        cpuPlacement_.enterAudioThread(tid);
         const int firstCpu = sched_getcpu();
         if (audioTid_.load(std::memory_order_relaxed) != tid ||
             (callbacks_.load(std::memory_order_relaxed) & 31) == 0) {
@@ -600,6 +610,7 @@ private:
             std::fill_n(output, std::size_t(count) * 2, 0.0f);
             running_.store(false);
             state_.store(State::failed);
+            cpuPlacement_.restoreCurrentThread();
             return AAUDIO_CALLBACK_RESULT_STOP;
         }
         const auto end = clockNs(CLOCK_MONOTONIC);
@@ -607,6 +618,7 @@ private:
         const auto cpuElapsed = elapsedSince(cpuBegin, clockNs(CLOCK_THREAD_CPUTIME_ID));
         const int finalCpu = sched_getcpu();
         lastCpu_.store(finalCpu, std::memory_order_relaxed);
+        cpuPlacement_.observeCpu(finalCpu);
         std::uint64_t observedCpus = 0;
         if (firstCpu >= 0 && firstCpu < 64) observedCpus |= std::uint64_t(1) << firstCpu;
         if (finalCpu >= 0 && finalCpu < 64) observedCpus |= std::uint64_t(1) << finalCpu;
@@ -666,6 +678,7 @@ private:
     std::array<s16, kStagingFrames * 2> staging_{};
     rimu2000::MidiQueue midi_;
     rimu2000::PerformanceHint performanceHint_;
+    rimu2000::AudioCpuPlacement cpuPlacement_;
     TimingWindow window_;
     PublishedWindow recent_;
     bool jitBaseline_ = false; // callback-owned; reset only after close
@@ -679,6 +692,7 @@ private:
     std::atomic<State> state_{State::stopped};
     std::atomic<float> gain_{0.8f}, maxPercent_{0};
     std::atomic<int> rate_{0}, requestedFrames_{1024}, observedFrames_{0}, actualBuffer_{0}, burst_{0}, device_{0}, xruns_{0};
+    std::atomic<int> resamplerPhases_{0};
     std::atomic<int> audioTid_{0}, lastCpu_{-1}, policy_{-1}, priority_{0},
         performanceMode_{AAUDIO_PERFORMANCE_MODE_NONE}, sharingMode_{AAUDIO_SHARING_MODE_SHARED};
     std::atomic<std::uint64_t> frames_{0}, elapsedNs_{0}, callbacks_{0}, late_{0}, dropped_{0},
@@ -693,8 +707,8 @@ Engine& engine() { static Engine* instance = new Engine; return *instance; }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_rinoize_rimu2000_NativeEngine_start(JNIEnv* env, jclass, jstring roms,
-                                           jstring state, jint frames, jint device) {
-    const auto result = engine().start(fromJava(env, roms), fromJava(env, state), frames, device);
+                                           jstring state, jint frames, jint device, jint cpuMode) {
+    const auto result = engine().start(fromJava(env, roms), fromJava(env, state), frames, device, cpuMode);
     return env->NewStringUTF(result.c_str());
 }
 

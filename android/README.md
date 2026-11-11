@@ -1,10 +1,42 @@
-# RiMU2000 para Android — 0.1.1 alpha
+# RiMU2000 para Android — 0.1.2 alpha
 
 Primera aplicación independiente para Android del motor de [S-MU2000](https://github.com/tarboh/S-MU2000). Ejecuta el firmware del MU2000 y conserva la emulación del SH7043 y de los dos SWP30, incluidos los compiladores JIT ARM64 de upstream. La interfaz Android conecta ese motor con MIDI y audio del dispositivo.
 
 La alpha está orientada a la Samsung Galaxy Tab A9 y requiere Android 8.0 o superior con CPU ARM64. El rendimiento y la latencia deben medirse en la tablet: que el código compile no garantiza ausencia de cortes con todas las canciones o sonidos.
 
-## Cambios de 0.1.1
+## Cambios de 0.1.2
+
+Esta actualización responde a una medición en la A9 con JIT activo, pero 54,52 ms de trabajo por cada bloque de 42,67 ms. El motor consumía el 117,5 % del presupuesto y la conversión otro 10,3 %. El modo de CPU y el conversor se pueden evaluar por separado; todavía es necesario comprobar el rendimiento en la tablet.
+
+- **CPU del motor:** permite elegir **Automático (Android)**, el valor inicial, o **Núcleos de rendimiento**. El segundo modo consulta la capacidad que publica el dispositivo y solicita el grupo de mayor capacidad dentro de la máscara permitida al hilo de audio. Si no hay datos completos de capacidad, puede usar la frecuencia máxima como aproximación explícita. Si no hay información suficiente o no se distinguen grupos, conserva la selección de Android y muestra el motivo. No contiene números de CPU fijados para un modelo concreto.
+- La detección de CPU se hace antes de iniciar el stream. Las llamadas para aplicar y comprobar afinidad se hacen sobre el propio hilo, una sola vez al comenzar cada hilo de callback. No cambia su política ni prioridad, y no accede a sysfs en el procesamiento habitual. El panel muestra el criterio y las máscaras permitida, solicitada y efectiva, junto con cualquier error. ADPF sigue activo cuando está disponible.
+- **Conversión sinc de 64 coeficientes precalculados por fase.** Para 44.100 → 48.000 Hz hay 160 fases. Se conserva la tabla del filtro, el corte, la acumulación en doble precisión y la normalización especial del arranque. El avance racional evita la deriva acumulada de la posición. Esta ruta sólo se activa explícitamente en Android; las otras plataformas conservan su implementación. Las frecuencias con ciclos mayores a 2.048 fases vuelven al conversor genérico.
+- El diagnóstico reconoce `SCHED_RESET_ON_FORK` al mostrar la política del hilo; así una política FIFO no aparece como `?`. Es una corrección de la etiqueta, sin cambios de prioridad.
+- El contenido desplazado queda recortado al espacio útil, evitando que el título invada la barra de estado.
+
+La afinidad es una prueba reversible, no una promesa de mejora en todos los dispositivos. Reduce la libertad de Android para repartir ese hilo y puede cambiar consumo o temperatura. Volver a **Automático (Android)** y reiniciar el audio restaura el comportamiento normal. Referencias: [capacidad de CPU en Linux](https://docs.kernel.org/scheduler/sched-capacity.html) y [planificación y afinidad en Android](https://developer.android.com/agi/sys-trace/threads-scheduling).
+
+### Comparación en la A9
+
+1. Mantener la misma salida de auriculares, el mismo sonido y **2048 frames**.
+2. Iniciar con **Automático (Android)**, esperar a que termine el arranque y registrar el render reciente, el tiempo del motor y de conversión, los núcleos observados y cuántos xruns se agregan durante 20–30 segundos.
+3. Detener, seleccionar **Núcleos de rendimiento** e iniciar de nuevo. Repetir la misma secuencia de notas y la misma duración.
+4. Verificar en el panel que la máscara efectiva coincide con la selección solicitada. Si se mantiene en automático, el motivo o `errno` indica qué revisar.
+5. Buscar render sostenido por debajo del 100 %, con margen para los picos, y un contador de xruns que deje de crecer. Sólo después ensayar 1024 o 512 frames.
+
+Las cifras de CPU equivalen al tiempo de un núcleo, no al porcentaje de todos los núcleos de la tablet. La cantidad acumulada de xruns al arrancar importa menos que su crecimiento durante la prueba estable.
+
+### Validación de 0.1.2
+
+Las pruebas del conversor usan señales sintéticas sin ROMs y una referencia que calcula cada coeficiente de forma independiente. También comprueban el avance racional, los límites de entrada/salida, la invariancia al dividir el audio en bloques, el arranque, el reinicio y la ruta genérica. La ruta nueva conserva el filtro, pero no se presenta como idéntica byte por byte a la posición flotante acumulada anterior: esa posición puede tener deriva numérica.
+
+Las pruebas del selector de CPU no fijan afinidad en la máquina de CI: comprueban la selección sobre topologías y máscaras sintéticas, incluidas restricciones y datos incompletos. La aceptación de la afinidad, la colocación real, la temperatura y los xruns requieren la tablet física.
+
+Validación local: 64 casos del conversor y 12 escenarios de selección de CPU aprobados; AddressSanitizer y UndefinedBehaviorSanitizer sin errores en las pruebas del conversor. También pasan la verificación del motor sin ROMs, 6.176 casos del generador aleatorio, 80.000 mensajes MIDI concurrentes y los 6 escenarios del parser Java. El APK ARM64 compila con Android Lint sin errores y conserva la alineación ZIP/ELF de 16 KiB.
+
+En un microbenchmark del equipo de desarrollo, 480.000 frames de salida en bloques de 256 tardaron una mediana de 114,7 ms de CPU con el conversor anterior y 28,2 ms con el precalculado, sobre cinco pares de ejecuciones. Es una reducción del 75,4 % **sólo en esa prueba del conversor en el host**; no mide el motor completo ni predice el resultado en la A9. En la comparación con la ruta anterior, la diferencia máxima fue inferior a 1,12 unidades del último bit de PCM16, coherente con los cambios de borde que provocaba la deriva de su posición flotante; la referencia racional independiente conserva la respuesta prevista del filtro.
+
+## Cambios anteriores: 0.1.1
 
 Esta versión reduce trabajo repetido del motor y permite distinguir la ejecución real de los JIT de su mera presencia en el APK. Conserva el firmware, la emulación de ambos SWP30, la frecuencia interna de 44.100 Hz y el conversor sinc.
 
@@ -77,7 +109,7 @@ No se incluye una clave privada en el repositorio. Una compilación realizada en
 
 ## GitHub Actions
 
-El workflow **Android alpha** compila cuando se actualiza la rama `android` y permite una ejecución manual. Antes del APK ejecuta la verificación del motor de upstream sin ROMs, las pruebas del parser MIDI y de la cola concurrente; también ejecuta Android Lint. En **Actions → Android alpha → ejecución terminada → Artifacts**, descarga `RiMU2000-0.1.1-arm64`, que contiene el APK y el código fuente de ese commit.
+El workflow **Android alpha** compila cuando se actualiza la rama `android` y permite una ejecución manual. Antes del APK ejecuta la verificación del motor de upstream sin ROMs, las pruebas del parser MIDI, de la cola concurrente, del selector de CPU y del conversor sinc; también ejecuta Android Lint. En **Actions → Android alpha → ejecución terminada → Artifacts**, descarga `RiMU2000-0.1.2-arm64`, que contiene el APK y el código fuente de ese commit.
 
 La compilación de CI no necesita ROMs y no verifica sonido. Las pruebas con firmware y mediciones de rendimiento se realizan por separado en un dispositivo.
 

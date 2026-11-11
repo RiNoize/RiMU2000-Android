@@ -47,6 +47,12 @@ jobs:
           "$RUNNER_TEMP/rimu2000-tests/random-skip-test"
           javac -d "$RUNNER_TEMP/rimu2000-tests/classes" android/app/src/main/java/com/rinoize/rimu2000/MidiStreamParser.java android/tests/java/com/rinoize/rimu2000/MidiStreamParserTest.java
           java -cp "$RUNNER_TEMP/rimu2000-tests/classes" com.rinoize.rimu2000.MidiStreamParserTest
+      - name: Check CPU selection and sinc conversion without ROMs
+        run: |
+          c++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread android/native-tests/audio_cpu_placement_test.cpp -o "$RUNNER_TEMP/rimu2000-tests/cpu-placement-test"
+          "$RUNNER_TEMP/rimu2000-tests/cpu-placement-test"
+          c++ -std=c++20 -O2 -I src -I src/compat android/native-tests/resampler_test.cpp -o "$RUNNER_TEMP/rimu2000-tests/resampler-test"
+          "$RUNNER_TEMP/rimu2000-tests/resampler-test"
       - name: Install Android build tools
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
       - name: Build ARM64 alpha
@@ -55,14 +61,14 @@ jobs:
       - name: Prepare APK and corresponding source
         run: |
           mkdir -p dist
-          cp android/app/build/outputs/apk/debug/app-debug.apk dist/RiMU2000-0.1.1-arm64.apk
-          git archive --format=zip --prefix=RiMU2000-0.1.1-source/ -o dist/RiMU2000-0.1.1-source.zip HEAD
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/RiMU2000-0.1.2-arm64.apk
+          git archive --format=zip --prefix=RiMU2000-0.1.2-source/ -o dist/RiMU2000-0.1.2-source.zip HEAD
       - name: Upload APK and source
         uses: actions/upload-artifact@v4
         with:
-          name: RiMU2000-0.1.1-arm64
+          name: RiMU2000-0.1.2-arm64
           path: |
-            dist/RiMU2000-0.1.1-arm64.apk
-            dist/RiMU2000-0.1.1-source.zip
+            dist/RiMU2000-0.1.2-arm64.apk
+            dist/RiMU2000-0.1.2-source.zip
           if-no-files-found: error
           retention-days: 30

@@ -73,7 +73,7 @@ public final class MainActivity extends Activity {
 
     private TextView status, diagnostics, romStatus, midiStatus, gainLabel;
     private Button start, stop, panic, importFiles, importFolder, connectMidi, refreshMidi, applyProgram;
-    private Spinner outputPicker, bufferPicker, midiPicker, channelPicker;
+    private Spinner outputPicker, bufferPicker, cpuPicker, midiPicker, channelPicker;
     private EditText bankMsb, bankLsb, program;
     private Switch sustain;
     private KeyboardView keyboard;
@@ -199,7 +199,8 @@ public final class MainActivity extends Activity {
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(BG);
-        scroll.setClipToPadding(false);
+        // Keep scrolled content out of the system-bar space reserved by insets.
+        scroll.setClipToPadding(true);
         scroll.setOnApplyWindowInsetsListener((v, insets) -> {
             int left, top, right, bottom;
             if (Build.VERSION.SDK_INT >= 30) {
@@ -222,7 +223,7 @@ public final class MainActivity extends Activity {
         TextView title = text("RiMU2000", 30, INK);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         content.addView(title);
-        content.addView(text("YAMAHA MU2000 · MOTOR S-MU2000 · ALPHA 0.1.1", 11, MUTED));
+        content.addView(text("YAMAHA MU2000 · MOTOR S-MU2000 · ALPHA 0.1.2", 11, MUTED));
 
         LinearLayout display = card(content, 0xff0d2b43);
         TextView displayTitle = text("MU2000  /  ANDROID", 13, ACCENT);
@@ -254,8 +255,16 @@ public final class MainActivity extends Activity {
         setItems(bufferPicker, new String[]{"512 frames", "1024 frames", "2048 frames"});
         int savedBuffer = preferences.getInt("buffer", 1024);
         bufferPicker.setSelection(savedBuffer == 512 ? 0 : savedBuffer == 2048 ? 2 : 1);
+        TextView cpuLabel = text("CPU del motor", 11, MUTED);
+        cpuLabel.setPadding(0, dp(8), 0, 0);
+        routing.addView(cpuLabel);
+        cpuPicker = spinner(); routing.addView(cpuPicker);
+        cpuPicker.setPrompt("CPU del motor");
+        setItems(cpuPicker, new String[]{"Automático (Android)", "Núcleos de rendimiento"});
+        cpuPicker.setSelection(preferences.getInt("cpu_mode", 0) == 1 ? 1 : 0);
         TextView audioHelp = text("Empezá con 1024. El diagnóstico muestra el buffer que Android aceptó. "
-                + "Para cambiar la salida o el buffer, detené el audio.", 12, MUTED);
+                + "Si el render supera el 100 %, probá Núcleos de rendimiento. "
+                + "Para cambiar la salida, el buffer o la CPU, detené el audio.", 12, MUTED);
         audioHelp.setPadding(0, dp(7), 0, 0);
         routing.addView(audioHelp);
         gainLabel = text("Volumen de salida", 13, INK);
@@ -348,7 +357,7 @@ public final class MainActivity extends Activity {
 
     private void showLicenses() {
         worker.execute(() -> {
-            StringBuilder contents = new StringBuilder("RiMU2000 Android · alpha 0.1.1\n\n")
+            StringBuilder contents = new StringBuilder("RiMU2000 Android · alpha 0.1.2\n\n")
                     .append("Adaptación para Android del proyecto S-MU2000 de tarboh.\n")
                     .append("Proyecto no oficial, sin relación con Yamaha.\n\n")
                     .append("Código fuente del port:\nhttps://github.com/RiNoize/RiMU2000-Android\n\n")
@@ -396,9 +405,10 @@ public final class MainActivity extends Activity {
         }
         final int request = ++generation;
         final int frames = BUFFERS[Math.max(0, bufferPicker.getSelectedItemPosition())];
+        final int cpuMode = cpuPicker.getSelectedItemPosition() == 1 ? 1 : 0;
         AudioChoice selected = selectedOutput();
         final int deviceId = selected == null ? 0 : selected.id;
-        preferences.edit().putInt("buffer", frames).apply();
+        preferences.edit().putInt("buffer", frames).putInt("cpu_mode", cpuMode).apply();
         busy = true; starting = true;
         status.setText("Iniciando el MU2000… la primera carga puede tardar unos segundos.");
         updateControls();
@@ -407,7 +417,8 @@ public final class MainActivity extends Activity {
             if (destroyed || !visible || request != generation) return;
             String result;
             try {
-                result = NativeEngine.start(roms.getAbsolutePath(), state.getAbsolutePath(), frames, deviceId);
+                result = NativeEngine.start(roms.getAbsolutePath(), state.getAbsolutePath(),
+                        frames, deviceId, cpuMode);
             } catch (RuntimeException | LinkageError e) {
                 result = "No se pudo iniciar: " + e.getMessage();
             }
@@ -610,6 +621,7 @@ public final class MainActivity extends Activity {
         panic.setEnabled(available && running);
         outputPicker.setEnabled(!busy && !running);
         bufferPicker.setEnabled(!busy && !running);
+        cpuPicker.setEnabled(!busy && !running);
         importFiles.setEnabled(!busy && !running);
         importFolder.setEnabled(!busy && !running);
         applyProgram.setEnabled(available && running);
